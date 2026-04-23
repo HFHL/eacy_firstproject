@@ -238,6 +238,24 @@ class CRFRepo:
         job_type: str = "extract",
         patient_id: Optional[str] = None,
     ) -> Optional[str]:
+        """
+        创建抽取 job。幂等策略（P3 修复）：
+        同一 (document_id, schema_id, job_type) 若已有 pending/running job，
+        直接返回该 job_id，不新建重复任务。这样前端重复点"开始抽取"不会堆出僵尸 job。
+        """
+        existing = conn.execute(
+            """
+            SELECT id FROM ehr_extraction_jobs
+            WHERE document_id = ? AND schema_id = ? AND job_type = ?
+              AND status IN ('pending', 'running')
+            ORDER BY created_at DESC
+            LIMIT 1
+            """,
+            (document_id, schema_id, job_type),
+        ).fetchone()
+        if existing:
+            return existing["id"]
+
         job_id = _new_id("job")
         try:
             conn.execute(
@@ -300,7 +318,29 @@ class CRFRepo:
 
     # ─── 物化层写入 ────────────────────────────────────────────────────────
 
-    def ensure_schema_instance(self, conn: sqlite3.Connection, patient_id: str, schema_id: str, instance_type: str = "patient_ehr") -> str:
+    # instance_type → 新建 instance 时使用的默认 name。
+    _DEFAULT_INSTANCE_NAME = {
+        "patient_ehr": "电子病历夹",
+        "project_crf": "科研 CRF",
+    }
+
+    def ensure_schema_instance(
+        self,
+        conn: sqlite3.Connection,
+        patient_id: str,
+        schema_id: str,
+        instance_type: str = "patient_ehr",
+        instance_name: Optional[str] = None,
+    ) -> str:
+        """
+        如实例已存在则返回现有 id，否则创建新实例。
+
+        instance_name 的取值优先级：
+          1. 显式传入的 instance_name（调用方通常从 schema.name 或 project.name 派生）
+          2. _DEFAULT_INSTANCE_NAME 中按 instance_type 的默认值
+          3. schemas.name（再从 DB 取一次）
+          4. instance_type 原值兜底
+        """
         row = conn.execute(
             """
             SELECT id FROM schema_instances
@@ -311,13 +351,26 @@ class CRFRepo:
         ).fetchone()
         if row:
             return row["id"]
+
+        resolved_name = (instance_name or "").strip()
+        if not resolved_name:
+            resolved_name = self._DEFAULT_INSTANCE_NAME.get(instance_type, "").strip()
+        if not resolved_name:
+            schema_row = conn.execute(
+                "SELECT name FROM schemas WHERE id = ? LIMIT 1", (schema_id,)
+            ).fetchone()
+            if schema_row and schema_row["name"]:
+                resolved_name = str(schema_row["name"]).strip()
+        if not resolved_name:
+            resolved_name = instance_type
+
         new_id = _new_id("si")
         conn.execute(
             """
             INSERT INTO schema_instances (id, patient_id, schema_id, instance_type, name, status, created_at, updated_at)
-            VALUES (?, ?, ?, ?, '电子病历夹', 'draft', ?, ?)
+            VALUES (?, ?, ?, ?, ?, 'draft', ?, ?)
             """,
-            (new_id, patient_id, schema_id, instance_type, _now_iso(), _now_iso()),
+            (new_id, patient_id, schema_id, instance_type, resolved_name, _now_iso(), _now_iso()),
         )
         return new_id
 
@@ -442,6 +495,16 @@ class CRFRepo:
         field_path: str, candidate_id: Optional[str], value: Any,
         selected_by: str = "ai", overwrite_existing: bool = False,
     ) -> None:
+        """
+        写入 / 覆盖当前选定值。
+
+        覆盖规则（按字段级选中来源）：
+          - 若目标记录不存在 → 新建。
+          - 若已存在且 selected_by='user'（用户手动编辑过） → 除非 overwrite_existing=True
+            （如强制重建），否则保留用户编辑，不被 AI 结果覆盖。
+          - 若已存在且 selected_by!='user'（ai/system） → 总是用新值覆盖。
+            （修复 P2：之前默认不覆盖导致新一轮 AI 抽取无法更新旧 AI 候选。）
+        """
         row = conn.execute(
             """
             SELECT id, selected_by FROM field_value_selected
@@ -453,9 +516,10 @@ class CRFRepo:
             """,
             (instance_id, section_instance_id, row_instance_id, field_path),
         ).fetchone()
-        if row and not overwrite_existing:
-            return
         if row:
+            existing_by = (row["selected_by"] or "").lower()
+            if existing_by == "user" and not overwrite_existing:
+                return
             conn.execute(
                 """
                 UPDATE field_value_selected

@@ -1,3 +1,5 @@
+import { getEhrFieldHistoryV2 } from './patient'
+
 const API_BASE = '/api/v1/projects'
 
 async function parseJsonResponse(response) {
@@ -168,7 +170,9 @@ export const updateProjectPatientCrfFields = () => ok({})
 export const getProjectPatientCrfConflicts = () => ok([])
 export const resolveProjectPatientCrfConflict = () => ok({})
 export const resolveAllProjectPatientCrfConflicts = () => ok({})
-export const getProjectCrfFieldHistory = () => ok([])
+
+export const getProjectCrfFieldHistory = (projectId, patientId, fieldPath) =>
+  getEhrFieldHistoryV2(patientId, fieldPath, { projectId })
 export const startCrfExtraction = async (projectId, patientIds, mode, targetGroups) => {
   try {
     const response = await fetch(`/api/v1/projects/${encodeURIComponent(projectId)}/crf/extraction`, {

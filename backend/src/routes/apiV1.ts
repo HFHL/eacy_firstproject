@@ -20,6 +20,7 @@ router.use('/auth', notImplemented('认证模块'))
 router.use('/users', notImplemented('用户模块'))
 import patientsRouter from './patients.js'
 import ehrDataRouter from './ehrData.js'
+import adminRouter from './admin.js'
 
 router.use('/patients', patientsRouter)
 router.use('/patients', ehrDataRouter)
@@ -29,5 +30,6 @@ router.use('/schemas', schemasRouter)
 router.use('/projects', projectsRouter)
 router.use('/crf-templates', notImplemented('CRF模板模块'))
 router.use('/stats', notImplemented('统计模块'))
+router.use('/admin', adminRouter)
 
 export default router

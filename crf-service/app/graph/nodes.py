@@ -16,6 +16,7 @@ from typing import Any, Dict, List, Optional
 
 from app.config import settings
 from app.core.extract_pipeline import (
+    _trim_json_schema_form,
     extract_pipeline,
     get_document_for_extraction,
     load_schema,
@@ -87,12 +88,77 @@ def node_load_schema_and_docs(state: CRFExtractionState) -> Dict[str, Any]:
 
 def node_filter_units(state: CRFExtractionState) -> Dict[str, Any]:
     """
-    调用 extract_pipeline 获取可抽取单元列表。
-    每个单元 = 一个表单 + 裁剪后的子 schema + 命中的文档 ID 列表。
+    两种模式：
+
+    1) 全量模式（默认）：调 extract_pipeline 遍历 schema 所有 form，按 x-sources.primary
+       匹配患者文档的 doc_sub_type；每个命中的 form + 匹配到的文档 ID 列表构成一个 unit。
+
+    2) 靶向模式：state.target_section 非空时，直接裁出该 section 的子 schema，
+       把 state.document_ids 全部作为该唯一 unit 的 matched_document_ids；
+       **完全跳过 x-sources 子类型匹配**。用于「靶向上传」—— 用户在表单某个 section
+       上传一份文档，期望绕过子类型识别直接按该 section schema 对文档做 LLM 抽取。
     """
     patient_id = state.get("patient_id", "")
     schema_id = state.get("schema_id", "")
+    target_section = (state.get("target_section") or "").strip()
 
+    # ── 靶向模式 ──
+    if target_section:
+        specified_ids = state.get("document_ids") or []
+        if not specified_ids:
+            logger.warning("[filter] 靶向模式缺少 document_ids，无法抽取")
+            return {
+                "extraction_units": [],
+                "pipeline_report": f"靶向模式（{target_section}）：未提供 document_ids",
+                "pipeline_error": "targeted_no_documents",
+                "progress": {
+                    "node": "filter_units",
+                    "status": "done",
+                    "unit_count": 0,
+                    "mode": "targeted",
+                },
+            }
+
+        content = state.get("schema_content") or {}
+        trimmed = _trim_json_schema_form(content, target_section)
+        if trimmed is None:
+            logger.warning("[filter] 靶向 section 在 schema 中未找到：%s", target_section)
+            return {
+                "extraction_units": [],
+                "pipeline_report": f"靶向模式（{target_section}）：schema 中未找到该 section",
+                "pipeline_error": "targeted_section_not_found",
+                "progress": {
+                    "node": "filter_units",
+                    "status": "done",
+                    "unit_count": 0,
+                    "mode": "targeted",
+                },
+            }
+
+        unit = {
+            "form_name": target_section,
+            "primary_sources": [],
+            "secondary_sources": [],
+            "matched_document_ids": list(specified_ids),
+            "schema": trimmed,
+        }
+        report = (
+            f"靶向模式：section={target_section}，文档数={len(specified_ids)}（跳过 x-sources 匹配）"
+        )
+        logger.info("[filter] %s", report)
+        return {
+            "extraction_units": [unit],
+            "pipeline_report": report,
+            "pipeline_error": None,
+            "progress": {
+                "node": "filter_units",
+                "status": "done",
+                "unit_count": 1,
+                "mode": "targeted",
+            },
+        }
+
+    # ── 全量模式（原逻辑） ──
     pipeline_result = extract_pipeline(patient_id, schema_id)
 
     units = pipeline_result.get("trimmed_schemas") or []
@@ -122,6 +188,7 @@ def node_filter_units(state: CRFExtractionState) -> Dict[str, Any]:
             "node": "filter_units",
             "status": "done",
             "unit_count": len(units),
+            "mode": "full",
         },
     }
 
@@ -236,17 +303,46 @@ async def node_extract_units(state: CRFExtractionState) -> Dict[str, Any]:
 # Node 4: materialize — 将抽取结果物化到实例层表
 # ═══════════════════════════════════════════════════════════════════════════════
 
+def _collect_per_doc_task_results(unit_results: List[Dict[str, Any]]) -> Dict[str, List[Dict[str, Any]]]:
+    """
+    从 unit_results 按源文档分桶 task_results。
+
+    修复 P1：此前 node_extract_units 会把所有文档的 task_results 合并到一个全局 payload，
+    然后 node_materialize 对每个 doc_id 都物化"这份全局 payload"，导致：
+      1) field_value_candidates.source_document_id 与实际来源不符；
+      2) 每个字段在 N 个文档下重复 N 次落库。
+    正确做法：每个文档只物化自己 _extract_one_unit 里产生的 task_results。
+    """
+    buckets: Dict[str, List[Dict[str, Any]]] = {}
+    for unit in unit_results or []:
+        for doc_result in unit.get("documents") or []:
+            doc_id = doc_result.get("document_id")
+            extraction = doc_result.get("extraction")
+            if not doc_id or not extraction:
+                continue
+            task_res_list = extraction.get("task_results") or []
+            if not isinstance(task_res_list, list):
+                continue
+            bucket = buckets.setdefault(str(doc_id), [])
+            for tr in task_res_list:
+                if isinstance(tr, dict):
+                    bucket.append(tr)
+    return buckets
+
+
 def node_materialize(state: CRFExtractionState) -> Dict[str, Any]:
     """
-    将 extract_payload 中的 task_results 物化到
+    按"每个文档各自的 task_results"分别物化到：
     schema_instances / section_instances / field_value_candidates / field_value_selected。
     """
     patient_id = state.get("patient_id", "")
     schema_id = state.get("schema_id", "")
-    extract_payload = state.get("extract_payload") or {}
     instance_type = state.get("instance_type", "patient_ehr")
+    target_section = (state.get("target_section") or "").strip() or None
 
-    if not extract_payload.get("task_results"):
+    per_doc_results = _collect_per_doc_task_results(state.get("unit_results") or [])
+
+    if not per_doc_results:
         logger.info("[materialize] 无 task_results，跳过物化")
         return {
             "materialized": False,
@@ -256,43 +352,51 @@ def node_materialize(state: CRFExtractionState) -> Dict[str, Any]:
     repo = CRFRepo()
     materializer = Materializer(repo)
 
-    # 收集所有涉及的文档 ID，构建 content_list 映射
-    doc_ids_in_results = set()
-    for result in state.get("unit_results") or []:
-        for doc_result in result.get("documents") or []:
-            did = doc_result.get("document_id")
-            if did:
-                doc_ids_in_results.add(did)
-
     try:
+        instance_id: Optional[str] = None
+        materialized_docs: List[str] = []
         with repo.connect() as conn:
-            instance_id = None
-            for doc_id in doc_ids_in_results:
+            for doc_id, task_results in per_doc_results.items():
+                if not task_results:
+                    continue
                 doc = repo.get_document(conn, doc_id)
                 if not doc:
+                    logger.warning("[materialize] 文档不存在，跳过: %s", doc_id)
                     continue
+
                 content_list = ocr_payload_to_content_list(
                     doc.get("ocr_payload"), doc.get("raw_text"),
                 )
+                per_doc_payload = {"task_results": task_results}
+
                 instance_id = materializer.materialize(
                     conn=conn,
                     patient_id=patient_id,
                     document_id=doc_id,
                     schema_id=schema_id,
-                    extract_payload=extract_payload,
+                    extract_payload=per_doc_payload,
                     content_list=content_list,
                     instance_type=instance_type,
+                    target_section=target_section,
                 )
-                # 更新文档的物化状态
-                repo.mark_extract_success(conn, doc_id, state.get("job_id", ""), extract_payload)
+                repo.mark_extract_success(conn, doc_id, state.get("job_id", ""), per_doc_payload)
+                materialized_docs.append(doc_id)
 
             conn.commit()
 
-        logger.info("[materialize] 物化完成 instance=%s", instance_id)
+        logger.info(
+            "[materialize] 物化完成 instance=%s docs=%d",
+            instance_id, len(materialized_docs),
+        )
         return {
             "instance_id": instance_id,
-            "materialized": True,
-            "progress": {"node": "materialize", "status": "done"},
+            "materialized": bool(materialized_docs),
+            "materialized_document_ids": materialized_docs,
+            "progress": {
+                "node": "materialize",
+                "status": "done",
+                "materialized_docs": len(materialized_docs),
+            },
         }
     except Exception as exc:
         logger.exception("物化失败")

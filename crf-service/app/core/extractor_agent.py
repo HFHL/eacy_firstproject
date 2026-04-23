@@ -737,7 +737,7 @@ class _FormatValidator(BaseAgent):
                 f"[校验轮次 {attempt}] 抽取结果校验失败：{e}\n\n"
                 f"请严格重新输出纯 JSON，禁止解释、禁止 markdown、禁止思维链。\n"
                 f"输出格式必须为：\n"
-                f'{{{{"result": <当前任务结果>, "audit": {{{{"fields": {{{{...}}}}}}}}}}}}\n\n'
+                f'{{"result": <当前任务结果>, "audit": {{"fields": {{...}}}}}}\n\n'
                 f"要求：\n"
                 f"1. result 必须符合当前 task schema\n"
                 f"2. 顶层必须有 result 和 audit\n"
@@ -776,18 +776,18 @@ def _build_extraction_instruction(
 4. 只输出纯 JSON，不要 markdown，不要解释，不要思维链。
 
 【输出格式】
-{{{{
+{{
   "result": <符合当前 task schema 的 JSON>,
-  "audit": {{{{
-    "fields": {{{{
-      "<字段路径>": {{{{
+  "audit": {{
+    "fields": {{
+      "<字段路径>": {{
         "value": <与 result 对应字段相同的值>,
         "raw": <原文证据片段；无证据时为 null>,
         "source_id": <原文块标识，如 p0.3；无证据时为 null>
-      }}}}
-    }}}}
-  }}}}
-}}}}
+      }}
+    }}
+  }}
+}}
 
 【审计规则】
 1. audit.fields 必须覆盖你实际输出的叶子字段。
@@ -1194,7 +1194,7 @@ class EhrExtractorAgent:
                 simplified["properties"] = task.schema_node["properties"]
             if task.schema_node.get("items"):
                 simplified["items"] = task.schema_node["items"]
-            schema_snippet = json.dumps(simplified, ensure_ascii=False, indent=2)[:5000]
+            schema_snippet = json.dumps(simplified, ensure_ascii=False, indent=2)
 
             instruction = _build_extraction_instruction(
                 task.name, fields_text, schema_snippet, task.path

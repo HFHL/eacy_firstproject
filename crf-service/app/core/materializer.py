@@ -35,6 +35,7 @@ class Materializer:
         extract_payload: Dict[str, Any],
         content_list: Optional[List[Dict[str, Any]]] = None,
         instance_type: str = "patient_ehr",
+        target_section: Optional[str] = None,
     ) -> str:
         """
         将 documents.extract_result_json 里的 staged 抽取结果写入实例层表。
@@ -52,12 +53,13 @@ class Materializer:
         instance_id = self.repo.ensure_schema_instance(conn, patient_id, schema_id, instance_type)
         self.repo.ensure_instance_document(conn, instance_id, document_id, relation_type="source")
 
+        ts = (target_section or "").strip() or None
         run_id = self.repo.create_extraction_run(
             conn,
             instance_id=instance_id,
             document_id=document_id,
-            target_mode="full_instance",
-            target_path=None,
+            target_mode="targeted_section" if ts else "full_instance",
+            target_path=ts,
             model_name="ehr_extractor_agent",
             prompt_version="staged_materialize_v1",
         )

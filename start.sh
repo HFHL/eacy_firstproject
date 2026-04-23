@@ -22,6 +22,6 @@ npx concurrently \
   -n "backend,frontend,crf-api,celery" \
   -c "green,cyan,magenta,yellow" \
   "npm run dev -w backend" \
-  "npm run dev -w frontend" \
+  "npm run dev -w xidong-crf-prototype-new" \
   "cd crf-service && source .venv/bin/activate && uvicorn app.main:app --host 0.0.0.0 --port 8100 --reload" \
   "cd crf-service && source .venv/bin/activate && celery -A app.celery_app worker -l info -c 2"

@@ -87,7 +87,8 @@ export async function parseDocument(docId: string, objectKey: string): Promise<O
       'x-ti-secret-code': secret,
       'Content-Type':     'application/octet-stream',
     },
-    body: fileBuffer,
+    // Node fetch 的类型定义不直接接受 Buffer，这里转成 Uint8Array 保持同样的二进制内容。
+    body: new Uint8Array(fileBuffer),
   })
 
   if (!response.ok) {

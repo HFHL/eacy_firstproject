@@ -1,16 +1,21 @@
 import { Router, Request, Response } from 'express'
 import { randomUUID } from 'crypto'
 import db from '../db.js'
+import { crfServiceSubmitBatch } from '../services/crfServiceClient.js'
 
 const router = Router()
-
-const CRF_SERVICE_URL = (process.env.CRF_SERVICE_URL || 'http://localhost:8100').replace(/\/+$/, '')
 
 function nowIso() {
   return new Date().toISOString()
 }
 
 const ALLOWED_STATUS = new Set(['draft', 'active', 'paused', 'completed'])
+
+// 抽取任务兜底超时：DB 里 started_at 超过此阈值仍然在 pending/running，
+// 认为 Celery/Worker 已经挂掉或被清理，强制判定为 failed，避免前端无限期显示"运行中"。
+// 与 crf-service 中 EXTRACTION_SOFT_TIME_LIMIT_SEC 保持一致（20 分钟）。
+const EXTRACTION_STALE_TIMEOUT_MS = 20 * 60 * 1000
+const EXTRACTION_STALE_ERROR = '任务执行超过 20 分钟未完成，已自动标记为失败'
 
 function parseJsonObject(raw: unknown): Record<string, any> {
   if (!raw) return {}
@@ -324,6 +329,38 @@ function summarizeProjectTask(taskRow: any) {
     }
   } else if (status !== 'cancelled' && total === 0) {
     status = summary.submitted_job_count > 0 ? 'running' : 'idle'
+  }
+
+  // 兜底超时：状态仍然 pending/running，但 started_at 已经过去 20 分钟，
+  // 说明 Celery worker 已经挂掉或 broker 出问题，强制判定为失败
+  if (['pending', 'running'].includes(status)) {
+    const startedAtMs = Date.parse(taskRow.started_at || taskRow.created_at || '')
+    if (Number.isFinite(startedAtMs) && Date.now() - startedAtMs > EXTRACTION_STALE_TIMEOUT_MS) {
+      status = 'failed'
+      // 把所有 pending/running 的 job 一起标为 failed，避免下次还被当成"在跑"
+      if (jobIds.length > 0) {
+        const staleAt = nowIso()
+        try {
+          db.prepare(`
+            UPDATE ehr_extraction_jobs
+            SET status = 'failed',
+                last_error = ?,
+                completed_at = ?,
+                updated_at = ?
+            WHERE id IN (${jobIds.map(() => '?').join(',')})
+              AND status IN ('pending', 'running')
+          `).run(EXTRACTION_STALE_ERROR, staleAt, staleAt, ...jobIds)
+        } catch (err) {
+          console.warn('[summarizeProjectTask] 标记僵尸 job 失败:', err)
+        }
+      }
+      failed = Math.max(failed, total - completed)
+      pending = 0
+      running = 0
+      if (errors.length === 0) {
+        errors.push({ job_id: null, patient_id: null, document_id: null, message: EXTRACTION_STALE_ERROR })
+      }
+    }
   }
 
   const progress = total > 0 ? Math.round(((completed + failed) / total) * 100) : 0
@@ -1084,16 +1121,12 @@ router.post('/:projectId/crf/extraction', async (req: Request, res: Response) =>
         continue
       }
 
-      const response = await fetch(`${CRF_SERVICE_URL}/api/extract/batch`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            patient_id: patientId,
-            schema_id: proj.schema_id,
-            document_ids: docIds,
-            instance_type: 'project_crf',
-          })
-        })
+      const response = await crfServiceSubmitBatch({
+        patient_id: patientId,
+        schema_id: proj.schema_id,
+        document_ids: docIds,
+        instance_type: 'project_crf',
+      })
 
       if (!response.ok) {
         const errorText = await response.text()

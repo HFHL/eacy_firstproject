@@ -202,7 +202,37 @@ export const confirmGroupArchive = () => ok({ archived_count: 0, failed_count: 0
 export const createPatientAndArchiveGroup = () => ok({})
 export const moveDocumentToGroup = () => ok({})
 export const uploadAndArchiveToPatient = uploadDocument
-export const uploadAndArchiveAsync = () => ok({ task_id: 'local-task', document_id: 'local-document' })
+
+/**
+ * 靶向上传：把文件上传到指定患者下，并标记 target_section，后端在 OCR+meta 完成后
+ * 自动触发对该 section 的 LLM 抽取（绕过 x-sources 子类型匹配）。
+ *
+ * @param {File} file
+ * @param {string} patientId
+ * @param {{ targetSection?: string, projectId?: string, autoMergeEhr?: boolean }} [opts]
+ * @returns {Promise<{ success, code, message, data: { task_id, document_id } }>}
+ */
+export const uploadAndArchiveAsync = (file, patientId, opts = {}) => {
+  const fd = new FormData()
+  fd.append('file', file)
+  fd.append('patient_id', String(patientId || ''))
+  if (opts.targetSection) fd.append('target_section', String(opts.targetSection))
+  if (opts.projectId) fd.append('project_id', String(opts.projectId))
+  fd.append('auto_merge_ehr', opts.autoMergeEhr === false ? 'false' : 'true')
+  return fetch(`${API_BASE}/upload-and-archive-async`, {
+    method: 'POST',
+    body: fd,
+  }).then(async (res) => {
+    const text = await res.text()
+    let json = null
+    try { json = text ? JSON.parse(text) : null } catch {}
+    if (!res.ok) {
+      const msg = json?.message || `上传失败 (${res.status})`
+      throw Object.assign(new Error(msg), { response: { data: json } })
+    }
+    return json
+  })
+}
 export const extractEhrDataAsync = (documentId, payload = {}) =>
   request(`${API_BASE}/${documentId}/extract-ehr`, { 
     method: 'POST', 
@@ -210,10 +240,39 @@ export const extractEhrDataAsync = (documentId, payload = {}) =>
   })
 export const aiMatchPatientAsync = () => ok({ task_id: 'local-task' })
 export const batchAiMatchAsync = () => ok({ task_id: 'local-task', document_count: 0 })
-export const getDocumentTaskProgress = () => ok({ status: 'completed', progress: 100 })
-export const pollDocumentTaskProgress = async (_taskId, options = {}) => {
-  if (options.onProgress) options.onProgress({ status: 'completed', progress: 100 })
-  return { status: 'completed', progress: 100 }
+/**
+ * 查询靶向上传任务（= document_id）的聚合进度。
+ * @param {string} taskId
+ * @param {{ silent?: boolean }} [opts]
+ */
+export const getDocumentTaskProgress = async (taskId, opts = {}) => {
+  try {
+    return await request(`${API_BASE}/tasks/${encodeURIComponent(taskId)}`)
+  } catch (e) {
+    if (!opts.silent) console.error('getDocumentTaskProgress:', e)
+    return { success: false, code: e.response?.data?.code ?? 500, message: e.message, data: null }
+  }
+}
+
+/**
+ * 轮询任务进度直至 completed / failed。默认间隔 2s、超时 20min。
+ * @param {string} taskId
+ * @param {{ onProgress?: (data)=>void, intervalMs?: number, timeoutMs?: number, silent?: boolean }} [options]
+ */
+export const pollDocumentTaskProgress = async (taskId, options = {}) => {
+  const interval = options.intervalMs ?? 2000
+  const timeout = options.timeoutMs ?? 20 * 60 * 1000
+  const started = Date.now()
+  while (Date.now() - started < timeout) {
+    const res = await getDocumentTaskProgress(taskId, { silent: options.silent })
+    const data = res?.data
+    if (data && options.onProgress) options.onProgress(data)
+    if (data?.status === 'completed' || data?.status === 'failed') {
+      return data
+    }
+    await new Promise((r) => setTimeout(r, interval))
+  }
+  return { status: 'failed', progress: 0, message: '轮询超时' }
 }
 export const checkDuplicateFiles = () => ok({ duplicated: [] })
 

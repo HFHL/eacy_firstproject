@@ -1,0 +1,2112 @@
+/**
+ * Schema表单主组件
+ * 组合CategoryTree和FormPanel，提供完整的Schema驱动表单体验
+ * 支持三栏布局：左侧目录树 + 中间表单 + 右侧文档溯源
+ */
+import React, { useState, useCallback, useEffect, useRef, useMemo } from 'react'
+import {
+  Layout,
+  Button,
+  Space,
+  message,
+  Modal,
+  Spin,
+  Typography,
+  Tooltip,
+  Badge,
+  Empty,
+  Tag,
+  Divider,
+  Tabs,
+  Upload
+} from 'antd'
+import {
+  SaveOutlined,
+  UndoOutlined,
+  CloudSyncOutlined,
+  ExclamationCircleOutlined,
+  CheckCircleOutlined,
+  FileTextOutlined,
+  RightOutlined,
+  LeftOutlined,
+  PushpinOutlined,
+  PushpinFilled,
+  FileSearchOutlined,
+  HistoryOutlined,
+  EyeOutlined,
+  FilePdfOutlined,
+  ClockCircleOutlined,
+  UserOutlined,
+  EditOutlined,
+  UploadOutlined,
+  ZoomInOutlined,
+  ZoomOutOutlined,
+  RotateRightOutlined,
+  ReloadOutlined,
+  DatabaseOutlined,
+  DragOutlined
+} from '@ant-design/icons'
+import { SchemaFormProvider, useSchemaForm } from './SchemaFormContext'
+import CategoryTree from './CategoryTree'
+import FormPanel from './FormPanel'
+import { getDocumentDetail, getDocumentTempUrl, getDocumentPdfStreamUrl } from '../../api/document'
+import { getEhrFieldHistoryV3, getEhrFieldCandidatesV3, selectEhrFieldCandidateV3 } from '../../api/patient'
+import PdfPageWithHighlight from '../PdfPageWithHighlight'
+import { getProjectCrfFieldHistory, getProjectCrfFieldCandidates, selectProjectCrfFieldCandidate } from '../../api/project'
+import { maskSensitiveField } from '../../utils/sensitiveUtils'
+import {
+  toAuditPath as _toAuditPath,
+  toAuditPathWithoutIndex as _toAuditPathWithoutIndex,
+  normalizePathKey as _normalizePathKey,
+  getNestedValue as _getNestedValue,
+  hasNestedKey as _hasNestedKey,
+  formatAuditDisplayValue as _formatAuditDisplayValue,
+  resolveFieldAudit,
+  collectPatientAuditFieldMaps,
+} from '../../utils/auditResolver'
+import DocumentDetailModal from '../../pages/PatientDetail/tabs/DocumentsTab/components/DocumentDetailModal'
+import SplitterHandle from '../Common/SplitterHandle'
+import { appThemeToken } from '../../styles/themeTokens'
+
+const { Sider, Content } = Layout
+const { Text, Paragraph } = Typography
+
+function _resolveFieldAuditFromExtractionMetadata(data, dotPath) {
+  if (!dotPath) return null
+  const fieldMaps = collectPatientAuditFieldMaps(data)
+  if (fieldMaps.length === 0) return null
+  return resolveFieldAudit(fieldMaps, dotPath)
+}
+
+function _buildSourceLocationFromAudit(audit) {
+  if (!audit || typeof audit !== 'object') return null
+  if (audit.source_location) return audit.source_location
+  if (Array.isArray(audit.bbox) && audit.bbox.length >= 4) {
+    return {
+      bbox: audit.bbox,
+      page: typeof audit.page_idx === 'number' ? audit.page_idx + 1 : 1,
+    }
+  }
+  return null
+}
+
+function useAutoSave(enabled, interval, onSave) {
+  const timerRef = useRef(null)
+  const { isDirty, draftData } = useSchemaForm()
+  useEffect(() => {
+    if (!enabled || !isDirty) return
+    if (timerRef.current) clearTimeout(timerRef.current)
+    timerRef.current = setTimeout(() => { if (onSave) onSave(draftData, 'auto') }, interval)
+    return () => { if (timerRef.current) clearTimeout(timerRef.current) }
+  }, [enabled, isDirty, draftData, interval, onSave])
+}
+
+const Toolbar = ({ onSave, onReset, saving, autoSaveEnabled, onToggleAutoSave }) => {
+  const { isDirty } = useSchemaForm()
+  return (
+    <div style={{ display: 'flex', justifyContent: 'flex-end', alignItems: 'center', padding: '10px 16px', background: appThemeToken.colorBgContainer, borderBottom: `1px solid ${appThemeToken.colorBorder}`, borderRadius: '8px 8px 0 0' }}>
+      <Space>
+        <Tooltip title={autoSaveEnabled ? '关闭自动保存' : '开启自动保存'}>
+          <Button type={autoSaveEnabled ? 'primary' : 'default'} ghost={autoSaveEnabled} size="small" icon={<CloudSyncOutlined />} onClick={onToggleAutoSave}>自动保存 {autoSaveEnabled ? '开' : '关'}</Button>
+        </Tooltip>
+        <Button size="small" icon={<UndoOutlined />} onClick={onReset} disabled={!isDirty}>重置</Button>
+        <Button type="primary" size="small" icon={<SaveOutlined />} onClick={() => onSave('manual')} loading={saving} disabled={!isDirty}>保存</Button>
+      </Space>
+    </div>
+  )
+}
+
+/** 从 8 点 position [x1,y1,x2,y2,x3,y3,x4,y4] 得到包围矩形 [minX, minY, maxX, maxY]（0–1000 归一化）。
+ * 若提供 pageWidth、pageHeight，按页面宽高分别归一化，避免框偏移；
+ * 否则若坐标明显为像素（max > 1000），则用单一比例缩放到 0–1000。 */
+function _positionToBbox(position, pageWidth, pageHeight) {
+  if (!Array.isArray(position) || position.length < 8) return null
+  const xs = [position[0], position[2], position[4], position[6]]
+  const ys = [position[1], position[3], position[5], position[7]]
+  let minX = Math.min(...xs)
+  let minY = Math.min(...ys)
+  let maxX = Math.max(...xs)
+  let maxY = Math.max(...ys)
+  const hasPageSize = typeof pageWidth === 'number' && pageWidth > 0 && typeof pageHeight === 'number' && pageHeight > 0
+  if (hasPageSize) {
+    minX = (minX / pageWidth) * 1000
+    minY = (minY / pageHeight) * 1000
+    maxX = (maxX / pageWidth) * 1000
+    maxY = (maxY / pageHeight) * 1000
+  } else {
+    const maxCoord = Math.max(maxX, maxY)
+    if (maxCoord > 1000 && maxCoord > 0) {
+      const scale = 1000 / maxCoord
+      minX *= scale
+      minY *= scale
+      maxX *= scale
+      maxY *= scale
+    }
+  }
+  return [minX, minY, maxX, maxY]
+}
+
+/** 将 history 接口的 source_location 转为预览组件用的 activeCoordinates（支持单个或多个区块）。
+ * 优先使用 content_list 的 position（8 点），无则使用 bbox（4 点）。
+ *
+ * 坐标单位说明：
+ *   - 0~1000 归一化：pageWidth/pageHeight = 1000
+ *   - 原图像素（> 1100）：pageWidth/pageHeight = null，由渲染侧按
+ *     图片 naturalWidth/naturalHeight 换算。
+ */
+function _sourceLocationToCoordinates(loc) {
+  if (!loc) return null
+
+  const toCoord = (item) => {
+    if (!item || typeof item !== 'object') return null
+    // 优先使用 position（8 点），再回退到 bbox（4 点）
+    let bbox = item.bbox
+    if ((!bbox || bbox.length < 4) && Array.isArray(item.position) && item.position.length >= 8) {
+      bbox = _positionToBbox(
+        item.position,
+        item.page_width,
+        item.page_height
+      )
+    }
+    if (!Array.isArray(bbox) || bbox.length < 4) return null
+    const [x1, y1, x2, y2] = bbox.map(Number)
+    const page = item.page != null ? Number(item.page) : 1
+    // 根据数值量级自动识别坐标单位：<=1100 视为 0-1000 归一化，否则视为原图像素
+    const maxV = Math.max(
+      Math.abs(x1), Math.abs(y1), Math.abs(x2), Math.abs(y2)
+    )
+    const isPixel = maxV > 1100
+    return {
+      x: x1,
+      y: y1,
+      width: x2 - x1,
+      height: y2 - y1,
+      pageWidth: isPixel ? null : 1000,
+      pageHeight: isPixel ? null : 1000,
+      pageIdx: Math.max(0, page - 1)
+    }
+  }
+
+  // 多个区块：loc 为数组
+  if (Array.isArray(loc)) {
+    const coords = loc.map(toCoord).filter(Boolean)
+    return coords.length ? coords : null
+  }
+
+  // 单个区块：loc 为对象
+  if (typeof loc === 'object') {
+    return toCoord(loc)
+  }
+  return null
+}
+
+/**
+ * 将文档集合（数组或对象映射）标准化为数组。
+ * @param {Array|Object|null|undefined} docs
+ * @returns {Array<Object>}
+ */
+function normalizeDocumentCollection(docs) {
+  if (!docs) return []
+  if (Array.isArray(docs)) return docs.filter(Boolean)
+  if (typeof docs === 'object') {
+    return Object.entries(docs).map(([id, doc]) => ({ id, ...(doc || {}) }))
+  }
+  return []
+}
+
+/**
+ * 统一候选文档来源：优先 extraction metadata，其次回退到外部传入列表。
+ * @param {Object} draftData
+ * @param {Array|Object|null|undefined} fallbackDocuments
+ * @returns {Array<Object>}
+ */
+function buildCandidateDocuments(draftData, fallbackDocuments) {
+  const metadataDocuments = normalizeDocumentCollection(draftData?._extraction_metadata?.documents)
+  if (metadataDocuments.length > 0) return metadataDocuments
+  return normalizeDocumentCollection(fallbackDocuments)
+}
+
+/**
+ * 获取文档展示名称。
+ * @param {Object} doc
+ * @returns {string}
+ */
+function getDocumentDisplayName(doc) {
+  return doc?.file_name || doc?.fileName || doc?.name || `文档_${doc?.id ?? '未知'}`
+}
+
+/**
+ * 获取文档类型标签（类型|子类型）。
+ * @param {Object} doc
+ * @returns {string}
+ */
+function getDocumentTypeLabel(doc) {
+  const mainType = doc?.document_type || doc?.file_type || '未知类型'
+  const subType = doc?.document_sub_type || doc?.sub_type || ''
+  return subType ? `${mainType} | ${subType}` : String(mainType)
+}
+
+/**
+ * 格式化文档上传时间。
+ * @param {Object} doc
+ * @returns {string}
+ */
+function formatDocumentUploadedAt(doc) {
+  const raw = doc?.upload_time || doc?.uploaded_at || doc?.created_at
+  if (!raw) return '-'
+  const d = new Date(raw)
+  if (Number.isNaN(d.getTime())) return String(raw)
+  return d.toLocaleString()
+}
+
+const ModificationHistory = ({
+  fieldPath,
+  rowUid = null,
+  patientId,
+  projectId,
+  refreshKey = 0,
+  onViewSource,
+  onHistoryLoaded,
+  onCandidateApplied,
+  isSensitive = false
+}) => {
+  const [history, setHistory] = useState([])
+  const [fieldMeta, setFieldMeta] = useState({
+    candidates: [],
+    selectedCandidateId: null,
+    hasValueConflict: false,
+    distinctValueCount: 0,
+  })
+  const [loading, setLoading] = useState(false)
+  const [selectingCandidateId, setSelectingCandidateId] = useState(null)
+  const [selectRefreshTick, setSelectRefreshTick] = useState(0)
+
+  const subFieldMatch = /\.(\d+)\.(.+)$/.exec(fieldPath)
+  const rowMatch = !subFieldMatch ? /\.(\d+)$/.exec(fieldPath) : null
+  const arrayIdx = subFieldMatch ? parseInt(subFieldMatch[1], 10) : rowMatch ? parseInt(rowMatch[1], 10) : null
+  const subFieldPath = subFieldMatch ? subFieldMatch[2] : null
+  /**
+   * 规范化字段路径，保持索引层级不丢失，避免可重复行/嵌套字段串历史。
+   * @param {string} path
+   * @returns {string}
+   */
+  const toHistoryQueryPath = useCallback((path) => String(path || '').trim(), [])
+
+  useEffect(() => {
+    let cancelled = false
+    async function fetchHistory() {
+      if (!fieldPath) {
+        setHistory([])
+        if (typeof onHistoryLoaded === 'function') onHistoryLoaded([])
+        return
+      }
+      if (projectId && patientId) {
+        const queryPath = toHistoryQueryPath(fieldPath)
+        setLoading(true)
+        try {
+          const res = await getProjectCrfFieldHistory(projectId, patientId, queryPath, rowUid)
+          const payload = res?.data || {}
+          const candidateRes = await getProjectCrfFieldCandidates(projectId, patientId, queryPath, rowUid)
+          const candidatePayload = candidateRes?.data || {}
+          const list = !cancelled && payload?.history ? payload.history : []
+          if (!cancelled) {
+            setHistory(list)
+            setFieldMeta({
+              candidates: Array.isArray(candidatePayload?.candidates) ? candidatePayload.candidates : [],
+              selectedCandidateId: candidatePayload?.selected_candidate_id || null,
+              hasValueConflict: !!candidatePayload?.has_value_conflict,
+              distinctValueCount: Number(candidatePayload?.distinct_value_count || 0),
+            })
+            if (typeof onHistoryLoaded === 'function') onHistoryLoaded(list, payload)
+          }
+        } catch (e) {
+          console.error('Failed to fetch project field history:', e)
+          if (!cancelled) {
+            setHistory([])
+            setFieldMeta({
+              candidates: [],
+              selectedCandidateId: null,
+              hasValueConflict: false,
+              distinctValueCount: 0,
+            })
+            if (typeof onHistoryLoaded === 'function') onHistoryLoaded([])
+          }
+        } finally {
+          if (!cancelled) setLoading(false)
+        }
+      } else if (patientId) {
+        const queryPath = toHistoryQueryPath(fieldPath)
+        setLoading(true)
+        try {
+          const res = await getEhrFieldHistoryV3(patientId, queryPath, rowUid)
+          const payload = res?.data || {}
+          const candidateRes = await getEhrFieldCandidatesV3(patientId, queryPath, rowUid)
+          const candidatePayload = candidateRes?.data || {}
+          const list = !cancelled && payload?.history ? payload.history : []
+          if (!cancelled) {
+            setHistory(list)
+            setFieldMeta({
+              candidates: Array.isArray(candidatePayload?.candidates) ? candidatePayload.candidates : [],
+              selectedCandidateId: candidatePayload?.selected_candidate_id || null,
+              hasValueConflict: !!candidatePayload?.has_value_conflict,
+              distinctValueCount: Number(candidatePayload?.distinct_value_count || 0),
+            })
+            if (typeof onHistoryLoaded === 'function') onHistoryLoaded(list, payload)
+          }
+        } catch (e) {
+          console.error('Failed to fetch field history:', e)
+          if (!cancelled) {
+            setHistory([])
+            setFieldMeta({
+              candidates: [],
+              selectedCandidateId: null,
+              hasValueConflict: false,
+              distinctValueCount: 0,
+            })
+            if (typeof onHistoryLoaded === 'function') onHistoryLoaded([])
+          }
+        } finally {
+          if (!cancelled) setLoading(false)
+        }
+      } else {
+        setHistory([])
+        setFieldMeta({
+          candidates: [],
+          selectedCandidateId: null,
+          hasValueConflict: false,
+          distinctValueCount: 0,
+        })
+        if (typeof onHistoryLoaded === 'function') onHistoryLoaded([])
+      }
+    }
+    fetchHistory()
+    return () => { cancelled = true }
+  }, [patientId, projectId, fieldPath, rowUid, refreshKey, onHistoryLoaded, selectRefreshTick, toHistoryQueryPath])
+  
+  const extractSubFieldValues = (item) => {
+    if (arrayIdx === null) return null
+    const oldArr = Array.isArray(item.old_value) ? item.old_value : null
+    const newArr = Array.isArray(item.new_value) ? item.new_value : null
+    if (subFieldPath) {
+      const oldSub = oldArr?.[arrayIdx] != null ? _getNestedValue(oldArr[arrayIdx], subFieldPath) : undefined
+      const newSub = newArr?.[arrayIdx] != null ? _getNestedValue(newArr[arrayIdx], subFieldPath) : undefined
+      return { oldSub, newSub }
+    }
+    return { oldSub: oldArr?.[arrayIdx], newSub: newArr?.[arrayIdx] }
+  }
+
+  // 格式化值的显示（敏感字段自动脱敏）
+  const formatValue = (val) => {
+    if (val === null || val === undefined) return '—'
+    let str
+    if (typeof val === 'object') {
+      try {
+        str = JSON.stringify(val)
+        if (str.length > 50) str = str.substring(0, 50) + '...'
+      } catch {
+        str = String(val)
+      }
+    } else {
+      str = String(val)
+      if (str.length > 50) str = str.substring(0, 50) + '...'
+    }
+    if (isSensitive && str && str !== '—') {
+      return maskSensitiveField(str, fieldPath)
+    }
+    return str
+  }
+
+  const visibleHistory = useMemo(() => history.filter((item) => {
+    if (arrayIdx === null) return true
+    const sub = extractSubFieldValues(item)
+    if (!sub) return true
+    return formatValue(sub.oldSub) !== formatValue(sub.newSub)
+  }), [history, arrayIdx, subFieldPath, fieldPath, isSensitive])
+  
+  // 判断是否为抽取类操作
+  const isExtractAction = (changeType) => ['extract', 'merge', 'merge_append', 'merge_dedupe', 'initial_extract'].includes(changeType)
+
+  /**
+   * 统一读取候选值中的真实显示值。
+   * @param {Record<string, any>} candidate
+   * @returns {any}
+   */
+  const getCandidateDisplayValue = (candidate) => {
+    const raw = candidate?.value
+    if (raw && typeof raw === 'object' && Object.prototype.hasOwnProperty.call(raw, 'value')) {
+      return raw.value
+    }
+    return raw
+  }
+
+  /**
+   * 选择并固化候选值。
+   * @param {string} candidateId
+   * @returns {Promise<void>}
+   */
+  const handleSelectCandidate = async (candidateId) => {
+    if (!candidateId || !fieldPath) return
+    const queryPath = toHistoryQueryPath(fieldPath)
+    setSelectingCandidateId(candidateId)
+    const prevSelectedId = fieldMeta.selectedCandidateId
+    setFieldMeta((meta) => ({ ...meta, selectedCandidateId: candidateId }))
+    try {
+      const selectedCandidate = (fieldMeta.candidates || []).find((item) => item?.id === candidateId)
+      const selectedValue = getCandidateDisplayValue(selectedCandidate)
+      if (projectId && patientId) {
+        await selectProjectCrfFieldCandidate(projectId, patientId, queryPath, candidateId, undefined, rowUid)
+      } else if (patientId) {
+        await selectEhrFieldCandidateV3(patientId, queryPath, candidateId, undefined, rowUid)
+      }
+      if (typeof onCandidateApplied === 'function' && selectedCandidate) {
+        onCandidateApplied(queryPath, selectedValue, rowUid)
+      }
+      message.success('已采用此值')
+      setSelectRefreshTick((tick) => tick + 1)
+    } catch (error) {
+      setFieldMeta((meta) => ({ ...meta, selectedCandidateId: prevSelectedId }))
+      const backendMsg = error?.response?.data?.message || error?.message
+      message.error(`采用失败: ${backendMsg || '未知错误'}`)
+    } finally {
+      setSelectingCandidateId(null)
+    }
+  }
+  
+  return (
+    <div style={{ marginTop: 12 }}>
+      <div style={{ display: 'flex', alignItems: 'center', marginBottom: 8, padding: '6px 8px', background: appThemeToken.colorFillTertiary, borderRadius: 4 }}>
+        <HistoryOutlined style={{ color: appThemeToken.colorPrimary, marginRight: 6 }} />
+        <Text strong style={{ fontSize: 12 }}>修改历史</Text>
+        {loading ? (
+          <Spin size="small" style={{ marginLeft: 8 }} />
+        ) : (
+          <Badge count={visibleHistory.length} size="small" style={{ marginLeft: 8, backgroundColor: visibleHistory.length > 0 ? appThemeToken.colorPrimary : appThemeToken.colorTextTertiary }} />
+        )}
+      </div>
+      {loading ? (
+        <div style={{ textAlign: 'center', padding: 16 }}><Spin size="small" /><div style={{ marginTop: 8, fontSize: 12, color: appThemeToken.colorTextTertiary }}>加载中...</div></div>
+      ) : visibleHistory.length === 0 ? (
+        <div style={{ textAlign: 'center', padding: 16, color: appThemeToken.colorTextTertiary, fontSize: 12 }}>暂无修改记录</div>
+      ) : (
+        <div style={{ paddingLeft: 8, maxHeight: 300, overflowY: 'auto' }} className="schema-form-scrollable hover-scrollbar">
+          {visibleHistory.map((item, index) => (
+            <div key={item.id} style={{ position: 'relative', paddingLeft: 16, paddingBottom: index < visibleHistory.length - 1 ? 12 : 0, borderLeft: index < visibleHistory.length - 1 ? `1px solid ${appThemeToken.colorBorder}` : 'none' }}>
+              <div style={{ position: 'absolute', left: -4, top: 4, width: 8, height: 8, borderRadius: '50%', background: isExtractAction(item.change_type) ? appThemeToken.colorPrimary : appThemeToken.colorSuccess, border: `2px solid ${appThemeToken.colorBgContainer}`, boxShadow: '0 0 0 1px ' + (isExtractAction(item.change_type) ? appThemeToken.colorPrimary : appThemeToken.colorSuccess) }} />
+              <div style={{ background: appThemeToken.colorBgContainer, padding: '8px 10px', borderRadius: 4, border: `1px solid ${appThemeToken.colorBorder}` }}>
+                <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 4 }}>
+                  <Text type="secondary" style={{ fontSize: 12 }}>
+                    <ClockCircleOutlined style={{ marginRight: 4 }} />
+                    {item.created_at ? new Date(item.created_at).toLocaleString('zh-CN', { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' }) : '—'}
+                  </Text>
+                  <Text style={{ fontSize: 12, color: appThemeToken.colorTextSecondary }}>
+                    <UserOutlined style={{ marginRight: 4 }} />
+                    {item.operator_name || (item.operator_type === 'ai' ? 'AI系统' : '未知')}
+                  </Text>
+                </div>
+                <div style={{ marginBottom: 4, display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
+                  <Tag color={isExtractAction(item.change_type) ? 'blue' : 'green'} style={{ fontSize: 12, padding: '0 4px', lineHeight: '16px' }}>
+                    {item.change_type_display || item.change_type}
+                  </Tag>
+                  {item.source_document_id && typeof onViewSource === 'function' && (
+                    <Button type="link" size="small" style={{ padding: 0, height: 'auto', fontSize: 12 }} icon={<FileSearchOutlined />} onClick={() => onViewSource(item)}>
+                      查看溯源
+                    </Button>
+                  )}
+                </div>
+                {(() => {
+                  const sub = extractSubFieldValues(item)
+                  const displayOld = sub ? sub.oldSub : item.old_value
+                  const displayNew = sub ? sub.newSub : item.new_value
+                  if (sub && formatValue(displayOld) === formatValue(displayNew)) {
+                    return <div style={{ fontSize: 12, color: appThemeToken.colorTextTertiary }}>（此字段未变更）</div>
+                  }
+                  if (displayOld !== null && displayOld !== undefined) {
+                    return (
+                      <div style={{ fontSize: 12 }}>
+                        <span style={{ color: appThemeToken.colorError, textDecoration: 'line-through' }}>{formatValue(displayOld)}</span>
+                        <span style={{ margin: '0 6px', color: appThemeToken.colorTextTertiary }}>→</span>
+                        <span style={{ color: appThemeToken.colorSuccess, fontWeight: 500 }}>{formatValue(displayNew)}</span>
+                      </div>
+                    )
+                  }
+                  return (
+                    <div style={{ fontSize: 12 }}>
+                      <span style={{ color: appThemeToken.colorPrimary }}>新值: </span>
+                      <span style={{ fontWeight: 500 }}>{formatValue(displayNew)}</span>
+                    </div>
+                  )
+                })()}
+                {item.source_document_name && (
+                  <div style={{ marginTop: 4, color: appThemeToken.colorTextSecondary, fontSize: 12 }}>
+                    <FileTextOutlined style={{ marginRight: 4 }} />
+                    来源: {item.source_document_name}
+                  </div>
+                )}
+                {item.remark && (
+                  <div style={{ marginTop: 4, color: appThemeToken.colorTextSecondary, fontSize: 12 }}>
+                    <EditOutlined style={{ marginRight: 4 }} />
+                    备注: {item.remark}
+                  </div>
+                )}
+              </div>
+            </div>
+          ))}
+        </div>
+      )}
+
+      {!loading && fieldMeta.candidates.length > 0 && (
+        <div style={{ marginTop: 12 }}>
+          <div style={{ display: 'flex', alignItems: 'center', marginBottom: 8, padding: '6px 8px', background: appThemeToken.colorFillTertiary, borderRadius: 4 }}>
+            <DatabaseOutlined style={{ color: appThemeToken.colorPrimary, marginRight: 6 }} />
+            <Text strong style={{ fontSize: 12 }}>候选值</Text>
+            {fieldMeta.hasValueConflict && (
+              <Tag color="orange" style={{ marginLeft: 8 }}>
+                多值差异 {fieldMeta.distinctValueCount}
+              </Tag>
+            )}
+          </div>
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
+            {fieldMeta.candidates.map((candidate) => {
+              const candidateId = candidate?.id
+              const isSelected = candidateId && candidateId === fieldMeta.selectedCandidateId
+              return (
+                <div
+                  key={candidateId}
+                  style={{
+                    border: `1px solid ${isSelected ? appThemeToken.colorPrimary : appThemeToken.colorBorder}`,
+                    borderRadius: 6,
+                    padding: 8,
+                    background: isSelected ? appThemeToken.colorPrimaryBg : appThemeToken.colorBgContainer,
+                  }}
+                >
+                  <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 8 }}>
+                    <Text style={{ fontSize: 12, fontWeight: 500 }}>{formatValue(getCandidateDisplayValue(candidate))}</Text>
+                    <Button
+                      type={isSelected ? 'default' : 'primary'}
+                      size="small"
+                      disabled={isSelected}
+                      loading={selectingCandidateId === candidateId}
+                      onClick={() => handleSelectCandidate(candidateId)}
+                    >
+                      {isSelected ? '当前值' : '采用此值'}
+                    </Button>
+                  </div>
+                  <div style={{ marginTop: 6, fontSize: 12, color: appThemeToken.colorTextSecondary }}>
+                    <div>来源文档: {candidate?.source_document_id || '—'}</div>
+                    <div>页码: {candidate?.source_page ?? '—'}</div>
+                    {candidate?.source_text ? <div>原文片段: {candidate.source_text}</div> : null}
+                    {candidate?.confidence != null ? <div>置信度: {candidate.confidence}</div> : null}
+                  </div>
+                </div>
+              )
+            })}
+          </div>
+        </div>
+      )}
+    </div>
+  )
+}
+
+const SourceDocumentPreview = ({ documentInfo, activeCoordinates, panelWidth = 480, loading = false }) => {
+  const containerRef = useRef(null)
+  const imgRef = useRef(null)
+  const [imageLoaded, setImageLoaded] = useState(false)
+  const [imageDimensions, setImageDimensions] = useState({ width: 0, height: 0 })
+  const [displayDimensions, setDisplayDimensions] = useState({ width: 0, height: 0 })
+  const [scale, setScale] = useState(100)
+  const [rotation, setRotation] = useState(0)
+  const [imgOffset, setImgOffset] = useState({ x: 0, y: 0 })
+  const [isDragging, setIsDragging] = useState(false)
+  const [dragStart, setDragStart] = useState({ x: 0, y: 0 })
+  const isPdf = documentInfo?.fileType === 'pdf'
+  const effectiveMaxW = Math.max(panelWidth - 32, 200)
+  const [pdfPage, setPdfPage] = useState(1)
+  const [pdfPageCount, setPdfPageCount] = useState(null)
+  const handleImageLoad = useCallback((e) => {
+    const { naturalWidth, naturalHeight } = e.target
+    setImageDimensions({ width: naturalWidth, height: naturalHeight })
+    const displayW = Math.min(naturalWidth, effectiveMaxW)
+    const displayH = Math.round(displayW * (naturalHeight / naturalWidth))
+    setDisplayDimensions({ width: displayW, height: displayH })
+    setImageLoaded(true)
+    setScale(100)
+  }, [effectiveMaxW])
+  useEffect(() => {
+    if (!imageLoaded || !imageDimensions.width || !imageDimensions.height) return
+    const { width: nw, height: nh } = imageDimensions
+    const displayW = Math.min(nw, effectiveMaxW)
+    const displayH = Math.round(displayW * (nh / nw))
+    setDisplayDimensions({ width: displayW, height: displayH })
+  }, [effectiveMaxW, imageLoaded, imageDimensions])
+  const handleZoomIn = useCallback(() => setScale(s => Math.min(s + 25, 300)), [])
+  const handleZoomOut = useCallback(() => setScale(s => Math.max(s - 25, 25)), [])
+  const handleRotate = useCallback(() => setRotation(r => (r + 90) % 360), [])
+  const handleReset = useCallback(() => {
+    setScale(100)
+    setRotation(0)
+    setImgOffset({ x: 0, y: 0 })
+  }, [])
+  // 计算高亮坐标列表（可能为多块）
+  const coordsList = Array.isArray(activeCoordinates)
+    ? activeCoordinates.filter(Boolean)
+    : activeCoordinates
+      ? [activeCoordinates]
+      : []
+  const hasHighlight = coordsList.length > 0
+  const highlightLocations = hasHighlight
+    ? coordsList.map((c) => ({
+        page: (c.pageIdx != null ? c.pageIdx : 0) + 1,
+        bbox: [c.x, c.y, c.x + (c.width || 0), c.y + (c.height || 0)],
+      }))
+    : []
+
+  // 文档或高亮源变化时，重置当前页
+  useEffect(() => {
+    if (isPdf) {
+      const initial = highlightLocations[0]?.page || 1
+      setPdfPage(initial)
+    }
+  }, [isPdf, documentInfo?.fileUrl, JSON.stringify(highlightLocations)])
+
+  const locationsForCurrentPage = highlightLocations.filter((loc) => loc.page === pdfPage)
+
+  const handlePdfLoaded = useCallback((total) => {
+    if (typeof total === 'number' && total > 0) {
+      setPdfPageCount(total)
+      setPdfPage((p) => Math.min(Math.max(1, p), total))
+    }
+  }, [])
+  const renderHighlight = (opts = {}) => {
+    const { baseWidth = null, baseHeight = null, requireImageLoaded = true, applyTransform = true } = opts
+    if (!activeCoordinates || isPdf) {
+      return null
+    }
+    if (requireImageLoaded && !imageLoaded) {
+      return null
+    }
+    const coordsList = Array.isArray(activeCoordinates) ? activeCoordinates : [activeCoordinates]
+    if (!coordsList.length) return null
+    const { pageWidth, pageHeight } = coordsList[0] || {}
+    // 用显示尺寸（displayDimensions）而不是原始尺寸，这样 SVG 才能与实际渲染的图片对齐
+    const w0 = baseWidth || displayDimensions.width || imageDimensions.width
+    const h0 = baseHeight || displayDimensions.height || imageDimensions.height
+    if (!w0 || !h0) {
+      return null
+    }
+    // 从 pageCoordinates (0-1000 归一化 或 原图像素) 映射到 SVG 尺寸：
+    //  - 归一化：pageWidth/pageHeight = 1000，直接用
+    //  - 原图像素：pageWidth/pageHeight 为空，需要用图片 naturalWidth/naturalHeight 作为底
+    const pw = pageWidth || imageDimensions.width || 1000
+    const ph = pageHeight || imageDimensions.height || 1000
+    const scaleX = w0 / pw
+    const scaleY = h0 / ph
+    const svgTransform = applyTransform ? `scale(${scale / 100}) rotate(${rotation}deg)` : undefined
+    return (
+      <svg 
+        style={{ 
+          position: 'absolute', 
+          top: 0, 
+          left: 0, 
+          width: w0, 
+          height: h0, 
+          ...(svgTransform ? { transform: svgTransform, transformOrigin: 'center center' } : {}),
+          pointerEvents: 'none', 
+          zIndex: 10 
+        }} 
+        viewBox={`0 0 ${w0} ${h0}`}
+      >
+        {coordsList.map((c, idx) => {
+          if (!c) return null
+          const { x, y, width: w, height: h } = c
+          const rectX = x * scaleX
+          const rectY = y * scaleY
+          const rectW = w * scaleX
+          const rectH = h * scaleY
+          return (
+            <rect
+              key={idx}
+              x={rectX}
+              y={rectY}
+              width={Math.max(rectW, 2)}
+              height={Math.max(rectH, 2)}
+              fill="none"
+              stroke="#ff0000"
+              strokeWidth="1"
+              rx="0"
+            />
+          )
+        })}
+      </svg>
+    )
+  }
+  return (
+    <div style={{ display: 'flex', flexDirection: 'column', borderBottom: '1px solid #f0f0f0', background: '#fafafa', flexShrink: 0 }}>
+      <div style={{ padding: '4px 8px', background: '#fff', display: 'flex', justifyContent: 'center', gap: 2 }}>
+        <Tooltip title="缩小"><Button type="text" size="small" icon={<ZoomOutOutlined />} onClick={handleZoomOut} disabled={scale <= 25} /></Tooltip>
+        <Tooltip title="放大"><Button type="text" size="small" icon={<ZoomInOutlined />} onClick={handleZoomIn} disabled={scale >= 300} /></Tooltip>
+        <Tooltip title="旋转"><Button type="text" size="small" icon={<RotateRightOutlined />} onClick={handleRotate} /></Tooltip>
+        <Tooltip title="重置"><Button type="text" size="small" icon={<ReloadOutlined />} onClick={handleReset} /></Tooltip>
+      </div>
+      <div
+        ref={containerRef}
+        style={{
+          overflow: 'hidden',
+          display: 'flex',
+          justifyContent: 'center',
+          alignItems: 'flex-start',
+          background: '#f5f5f5',
+          padding: 8,
+          cursor: scale > 100 ? (isDragging ? 'grabbing' : 'grab') : 'default',
+          userSelect: isDragging ? 'none' : 'auto'
+        }}
+        onMouseDown={(e) => {
+          if (scale <= 100) return
+          setIsDragging(true)
+          setDragStart({ x: e.clientX - imgOffset.x, y: e.clientY - imgOffset.y })
+          e.preventDefault()
+        }}
+        onMouseMove={(e) => {
+          if (!isDragging) return
+          setImgOffset({
+            x: e.clientX - dragStart.x,
+            y: e.clientY - dragStart.y
+          })
+        }}
+        onMouseUp={() => setIsDragging(false)}
+        onMouseLeave={() => setIsDragging(false)}
+      >
+        {loading ? (
+          <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', minHeight: 120 }}>
+            <Spin size="large" tip="加载溯源文档..." />
+          </div>
+        ) : documentInfo?.fileUrl ? (
+        isPdf ? (
+          <div style={{ width: '100%', maxWidth: effectiveMaxW }}>
+            <div style={{ marginBottom: 6, display: 'flex', alignItems: 'center', justifyContent: 'space-between', fontSize: 12, color: '#666' }}>
+              <Space size={4}>
+                <Button
+                  size="small"
+                  onClick={() => setPdfPage((p) => Math.max(1, p - 1))}
+                  disabled={pdfPage <= 1}
+                >
+                  上一页
+                </Button>
+                <Button
+                  size="small"
+                  onClick={() =>
+                    setPdfPage((p) =>
+                      pdfPageCount ? Math.min(pdfPageCount, p + 1) : p + 1
+                    )
+                  }
+                  disabled={pdfPageCount != null && pdfPage >= pdfPageCount}
+                >
+                  下一页
+                </Button>
+              </Space>
+              <span>
+                第 {pdfPage}
+                {pdfPageCount ? ` / ${pdfPageCount}` : ''} 页
+              </span>
+            </div>
+            <div
+              style={{
+                position: 'relative',
+                display: 'inline-block',
+                transform: `translate(${imgOffset.x}px, ${imgOffset.y}px) scale(${scale / 100}) rotate(${rotation}deg)`,
+                transformOrigin: 'center center',
+                transition: isDragging ? 'none' : 'transform 0.2s',
+              }}
+            >
+              <PdfPageWithHighlight
+                pdfUrl={documentInfo.fileUrl}
+                pageNumber={pdfPage}
+                locations={locationsForCurrentPage}
+                maxWidth={effectiveMaxW}
+                loading={false}
+                bboxScale={1000}
+                onLoaded={handlePdfLoaded}
+              />
+            </div>
+          </div>
+        ) : (
+            <div
+              style={{
+                position: 'relative',
+                display: 'inline-block',
+                transform: `translate(${imgOffset.x}px, ${imgOffset.y}px) scale(${scale / 100}) rotate(${rotation}deg)`,
+                transformOrigin: 'center center',
+                transition: isDragging ? 'none' : 'transform 0.2s',
+              }}
+            >
+              <img 
+                ref={imgRef}
+                src={documentInfo.fileUrl} 
+                alt={documentInfo.fileName} 
+                style={{ 
+                  display: 'block',
+                  width: displayDimensions.width || 'auto',
+                  height: displayDimensions.height || 'auto',
+                  maxWidth: effectiveMaxW,
+                  boxShadow: '0 2px 8px rgba(0,0,0,0.1)', 
+                  borderRadius: 4, 
+                  opacity: imageLoaded ? 1 : 0.3,
+                  pointerEvents: 'none',
+                  userSelect: 'none'
+                }} 
+                onLoad={handleImageLoad} 
+                draggable={false}
+              />
+              {renderHighlight({ requireImageLoaded: true, applyTransform: false })}
+            </div>
+          )
+        ) : (
+          <div style={{ textAlign: 'center', color: appThemeToken.colorTextTertiary, padding: 24 }}><FileTextOutlined style={{ fontSize: 16, marginBottom: 8 }} /><div style={{ fontSize: 12 }}>暂无文档</div></div>
+        )}
+      </div>
+    </div>
+  )
+}
+
+const SourcePanel = ({
+  collapsed,
+  onToggle,
+  selectedField,
+  width: widthProp,
+  activeCoordinates = null,
+  patientId = null,
+  projectId = null,
+  historyRefreshKey = 0,
+  onRefreshHistory,
+  onCandidateApplied,
+  fallbackDocuments = [],
+  preferredDocument = null,
+  // 是否启用内容自适应布局（患者详情页 Schema 模式会传 true）
+  contentAdaptive = false,
+}) => {
+  const width = widthProp || Math.round(window.innerWidth * 0.25)
+  const { draftData } = useSchemaForm()
+  const isPinned = true
+  const [previewUrl, setPreviewUrl] = useState(null)
+  const [previewFileType, setPreviewFileType] = useState(null)
+  const [previewLoading, setPreviewLoading] = useState(false)
+  const [docModalOpen, setDocModalOpen] = useState(false)
+  const [docModalDoc, setDocModalDoc] = useState(null)
+  // 从修改历史中选中的一条记录，用于展示该条对应的文档预览与 bbox（有 source_document_id 即可溯源）
+  const [selectedHistoryItem, setSelectedHistoryItem] = useState(null)
+  // 标记当前是否处于“自动选中首条 revoke 记录但不触发溯源请求”的抑制状态；
+  // 一旦用户主动点击「查看溯源」，即关闭抑制，允许对该记录发起文档请求。
+  const [suppressAutoSourceDoc, setSuppressAutoSourceDoc] = useState(false)
+
+  const [floatingWidth, setFloatingWidth] = useState(() => {
+    const saved = localStorage.getItem('sourcePanelFloatingWidth')
+    return saved ? parseInt(saved, 10) : Math.round(window.innerWidth * 0.3)
+  })
+  const dragRef = useRef(null)
+
+  // 浮动模式下支持拖拽移动位置
+  const [floatingPos, setFloatingPos] = useState(() => {
+    const saved = localStorage.getItem('sourcePanelFloatingPos')
+    if (saved) {
+      try { return JSON.parse(saved) } catch { /* ignore */ }
+    }
+    return { x: null, y: 0 } // x=null 表示使用默认 right:0 定位
+  })
+  const [isDragging, setIsDragging] = useState(false)
+  const dragOffsetRef = useRef({ x: 0, y: 0 })
+
+  // 拖拽移动面板位置
+  const handlePanelDragStart = useCallback((e) => {
+    if (isPinned) return
+    e.preventDefault()
+    setIsDragging(true)
+    // 获取面板当前位置
+    const panelEl = dragRef.current?.closest?.('[data-source-panel]') || dragRef.current?.parentElement
+    if (!panelEl) return
+    const rect = panelEl.getBoundingClientRect()
+    dragOffsetRef.current = { x: e.clientX - rect.left, y: e.clientY - rect.top }
+
+    const onMouseMove = (ev) => {
+      ev.preventDefault()
+      const newX = Math.max(0, Math.min(window.innerWidth - 200, ev.clientX - dragOffsetRef.current.x))
+      const newY = Math.max(0, Math.min(window.innerHeight - 100, ev.clientY - dragOffsetRef.current.y))
+      setFloatingPos({ x: newX, y: newY })
+    }
+    const onMouseUp = () => {
+      setIsDragging(false)
+      document.removeEventListener('mousemove', onMouseMove)
+      document.removeEventListener('mouseup', onMouseUp)
+      document.body.style.cursor = 'default'
+      document.body.style.userSelect = 'auto'
+      setFloatingPos(pos => { localStorage.setItem('sourcePanelFloatingPos', JSON.stringify(pos)); return pos })
+    }
+    document.body.style.cursor = 'move'
+    document.body.style.userSelect = 'none'
+    document.addEventListener('mousemove', onMouseMove)
+    document.addEventListener('mouseup', onMouseUp)
+  }, [isPinned])
+
+  // 拖拽调整宽度（从左边缘拖）
+  const handleWidthDragStart = useCallback((e) => {
+    e.preventDefault()
+    e.stopPropagation()
+    const startX = e.clientX
+    const startWidth = floatingWidth
+    const startPosX = floatingPos.x !== null ? floatingPos.x : (window.innerWidth - floatingWidth)
+    const onMouseMove = (ev) => {
+      // 拖左边缘 → 向左拖增宽
+      const maxWidth = Math.round(window.innerWidth * 0.75)
+      const delta = startX - ev.clientX
+      const newWidth = Math.min(Math.max(startWidth + delta, 300), maxWidth)
+      setFloatingWidth(newWidth)
+      // 同时更新位置，使面板向左扩展
+      const newPosX = Math.max(0, startPosX - (newWidth - startWidth))
+      setFloatingPos(prev => ({ ...prev, x: newPosX }))
+    }
+    const onMouseUp = () => {
+      document.removeEventListener('mousemove', onMouseMove)
+      document.removeEventListener('mouseup', onMouseUp)
+      document.body.style.cursor = 'default'
+      document.body.style.userSelect = 'auto'
+      setFloatingWidth(w => { localStorage.setItem('sourcePanelFloatingWidth', String(w)); return w })
+      setFloatingPos(pos => { localStorage.setItem('sourcePanelFloatingPos', JSON.stringify(pos)); return pos })
+    }
+    document.body.style.cursor = 'col-resize'
+    document.body.style.userSelect = 'none'
+    document.addEventListener('mousemove', onMouseMove)
+    document.addEventListener('mouseup', onMouseUp)
+  }, [floatingWidth, floatingPos.x])
+
+  // 计算当前有效面板宽度（固定模式用 width prop，浮动模式用 floatingWidth）
+  const effectivePanelWidth = isPinned ? width : floatingWidth
+
+  // 切换字段或患者时清空“从修改历史选中的记录”，避免预览错位
+  useEffect(() => {
+    setSelectedHistoryItem(null)
+  }, [selectedField?.path, patientId])
+
+  // 有 patientId 时：默认展示与字段摘要均由修改历史决定；默认选“第一条”历史记录
+  const handleHistoryLoaded = useCallback((historyList) => {
+    if (!Array.isArray(historyList) || !patientId) return
+    const firstItem = historyList[0] || null
+    setSelectedHistoryItem(prev => {
+      if (!firstItem) return null
+      if (prev && historyList.some(h => h.id === prev.id)) return prev
+      return firstItem
+    })
+    // 如果首条是 revoke，则默认不触发文档溯源请求，直到用户手动点击「查看溯源」
+    setSuppressAutoSourceDoc(firstItem?.change_type === 'revoke')
+  }, [patientId])
+
+  // 当前字段是否为敏感字段
+  const isCurrentFieldSensitive = !!(selectedField?.schema?.['x-sensitive'])
+  // 数组行级点击：schema 为对象类型且路径末段是数字索引，说明用户点的是整行而非单个字段
+  const isArrayRowClick = !!(
+    selectedField?.path &&
+    (selectedField.schema?.type === 'object' || selectedField.schema?.properties) &&
+    /\.\d+$/.test(selectedField.path)
+  )
+  // 默认仍优先使用修改历史；科研项目模式下，如果历史缺少文档/定位信息，
+  // 再回退到 _extraction_metadata 的字段审计，和电子病历夹的字段来源规则保持一致。
+
+  // 当 displaySource 来自变更历史（new_value 为整个数组）且路径含数组下标+子字段时，
+  // 从 new_value[index][subField] 提取该字段的具体值，避免显示整个数组
+  const displaySubFieldValue = (() => {
+    if (!selectedHistoryItem || !selectedField?.path) return undefined
+    const newVal = selectedHistoryItem.new_value
+    if (!Array.isArray(newVal) || newVal.length === 0) return undefined
+    const mSub = /\.(\d+)\.(.+)$/.exec(selectedField.path)
+    const mRow = !mSub ? /\.(\d+)$/.exec(selectedField.path) : null
+    if (!mSub && !mRow) return undefined
+    const idx = parseInt((mSub || mRow)[1], 10)
+    if (mSub) {
+      const subPath = mSub[2]
+      const elem = newVal[idx]
+      if (!elem || typeof elem !== 'object') return undefined
+      if (!_hasNestedKey(elem, subPath)) return null
+      return _getNestedValue(elem, subPath)
+    }
+    return newVal[idx] !== undefined ? newVal[idx] : null
+  })()
+
+  const candidateDocuments = useMemo(
+    () => buildCandidateDocuments(draftData, fallbackDocuments),
+    [draftData, fallbackDocuments]
+  )
+  const metadataAudit = useMemo(() => {
+    if (!selectedField?.path || !projectId) return null
+    return _resolveFieldAuditFromExtractionMetadata(draftData, selectedField.path)
+  }, [draftData, projectId, selectedField?.path])
+
+  const getSchemaSourceRules = useCallback(() => {
+    const src = selectedField?.schema?.['x-sources']
+    if (!src || typeof src !== 'object') return { primary: [], secondary: [] }
+    const normalize = (arr) =>
+      (Array.isArray(arr) ? arr : [])
+        .map(v => String(v || '').trim().toLowerCase())
+        .filter(Boolean)
+    return {
+      primary: normalize(src.primary),
+      secondary: normalize(src.secondary)
+    }
+  }, [selectedField])
+
+  const docMatchesSourceRule = useCallback((doc, rule) => {
+    const content = [
+      doc?.file_name,
+      doc?.fileName,
+      doc?.name,
+      doc?.document_type,
+      doc?.document_sub_type
+    ]
+      .filter(Boolean)
+      .join(' ')
+      .toLowerCase()
+    const r = String(rule || '').trim().toLowerCase()
+    if (!content || !r) return false
+    if (content.includes(r)) return true
+    // 兼容“出院小结/记录”这类组合来源名：拆分后任一片段命中即可
+    const tokens = r
+      .split(/[\/、,，\s]+/)
+      .map(t => t.trim())
+      .filter(t => t.length >= 2)
+    return tokens.some(t => content.includes(t))
+  }, [])
+
+  // 仅保留精确溯源：无 document_id 时不再做文档猜测匹配
+  const resolveFallbackDocument = useCallback(() => {
+    if (!selectedField || candidateDocuments.length === 0) return null
+    const sourceRules = getSchemaSourceRules()
+
+    if (sourceRules.primary.length > 0) {
+      for (const doc of candidateDocuments) {
+        if (sourceRules.primary.some(rule => docMatchesSourceRule(doc, rule))) {
+          return doc
+        }
+      }
+    }
+    if (sourceRules.secondary.length > 0) {
+      for (const doc of candidateDocuments) {
+        if (sourceRules.secondary.some(rule => docMatchesSourceRule(doc, rule))) {
+          return doc
+        }
+      }
+    }
+
+    // schema 未命中，回退到原有策略
+    if (preferredDocument?.id) {
+      const matchedPreferred = candidateDocuments.find(d => String(d.id) === String(preferredDocument.id))
+      if (matchedPreferred) return matchedPreferred
+    }
+
+    const pathText = String(selectedField.path || selectedField.name || '').toLowerCase()
+    const pathTokens = pathText
+      .split(/[./_\-\s]+/)
+      .map(t => t.trim())
+      .filter(Boolean)
+
+    const scored = candidateDocuments.map((doc, idx) => {
+      const content = [
+        doc.file_name,
+        doc.fileName,
+        doc.name,
+        doc.document_type,
+        doc.document_sub_type
+      ]
+        .filter(Boolean)
+        .join(' ')
+        .toLowerCase()
+
+      let score = 0
+      for (const token of pathTokens) {
+        if (token && content.includes(token)) score += 2
+      }
+      return { doc, score, idx }
+    })
+
+    scored.sort((a, b) => (b.score - a.score) || (a.idx - b.idx))
+    return scored[0]?.doc || candidateDocuments[0]
+  }, [selectedField, candidateDocuments, preferredDocument, getSchemaSourceRules, docMatchesSourceRule])
+
+  const mergedDisplaySource = useMemo(() => {
+    if (!selectedHistoryItem && !metadataAudit) return null
+    if (!selectedHistoryItem) {
+      const metaSourceLocation = _buildSourceLocationFromAudit(metadataAudit)
+      return metaSourceLocation
+        ? { ...metadataAudit, source_location: metaSourceLocation }
+        : metadataAudit
+    }
+
+    if (!metadataAudit) return selectedHistoryItem
+
+    const merged = {
+      ...metadataAudit,
+      ...selectedHistoryItem,
+      source_document_id:
+        selectedHistoryItem.source_document_id ||
+        metadataAudit.source_document_id ||
+        metadataAudit.document_id ||
+        null,
+      document_id:
+        selectedHistoryItem.document_id ||
+        metadataAudit.document_id ||
+        selectedHistoryItem.source_document_id ||
+        null,
+      document_type: selectedHistoryItem.document_type || metadataAudit.document_type,
+      raw: selectedHistoryItem.raw || metadataAudit.raw,
+      page_idx:
+        typeof selectedHistoryItem.page_idx === 'number'
+          ? selectedHistoryItem.page_idx
+          : metadataAudit.page_idx,
+      bbox:
+        selectedHistoryItem.bbox ||
+        metadataAudit.bbox,
+      trace_level:
+        selectedHistoryItem.trace_level ||
+        metadataAudit.trace_level,
+    }
+
+    if (!merged.source_location) {
+      merged.source_location = _buildSourceLocationFromAudit(metadataAudit)
+    }
+    return merged
+  }, [selectedHistoryItem, metadataAudit])
+
+  const metadataCoordinates = useMemo(() => {
+    const metaSourceLocation = _buildSourceLocationFromAudit(metadataAudit)
+    return metaSourceLocation ? _sourceLocationToCoordinates(metaSourceLocation) : null
+  }, [metadataAudit])
+
+  const isHistorySourceSuppressed = !!(
+    selectedHistoryItem &&
+    selectedHistoryItem.change_type === 'revoke' &&
+    suppressAutoSourceDoc
+  )
+  const historySourceDocId = isHistorySourceSuppressed
+    ? null
+    : (selectedHistoryItem?.source_document_id ?? null)
+
+  const metadataSourceDocId = metadataAudit?.source_document_id || metadataAudit?.document_id || null
+  const sourceDocId = isHistorySourceSuppressed
+    ? null
+    : (historySourceDocId || metadataSourceDocId || null)
+  const fallbackDoc = !sourceDocId ? resolveFallbackDocument() : null
+  const effectiveCoordinates = selectedHistoryItem
+    ? (_sourceLocationToCoordinates(mergedDisplaySource?.source_location) || metadataCoordinates)
+    : metadataCoordinates
+  const displaySource = mergedDisplaySource
+  const sourcePageIdx = Array.isArray(effectiveCoordinates)
+    ? (effectiveCoordinates[0]?.pageIdx ?? 0)
+    : (effectiveCoordinates?.pageIdx ?? 0)
+
+  useEffect(() => {
+    let cancelled = false
+    async function load() {
+      setPreviewUrl(null)
+      setPreviewFileType(null)
+      if (!sourceDocId) return
+      setPreviewLoading(true)
+      try {
+        // 先请求文档详情获取 file_type，避免为 PDF 请求 temp-url（会走 OSS）；PDF 仅用 pdf-stream 同源接口
+        const detailRes = await getDocumentDetail(sourceDocId, {
+          include_content: false,
+          include_versions: false,
+          include_patients: false,
+          include_extracted: false
+        })
+        if (cancelled) return
+        const ft = (detailRes?.data?.file_type || '').toLowerCase()
+        setPreviewFileType(ft || null)
+        if (ft === 'pdf') {
+          setPreviewUrl(null)
+        } else {
+          const res = await getDocumentTempUrl(sourceDocId, 3600)
+          if (cancelled) return
+          const url = res?.data?.url || res?.data?.temp_url || res?.data?.data?.url
+          setPreviewUrl(url || null)
+        }
+      } catch (e) {
+        if (!cancelled) {
+          setPreviewFileType(null)
+          setPreviewUrl(null)
+        }
+      } finally {
+        if (!cancelled) setPreviewLoading(false)
+      }
+    }
+    load()
+    return () => {
+      cancelled = true
+    }
+  }, [sourceDocId])
+
+  if (collapsed) {
+    return (
+      <div style={{ width: 32, height: '100%', background: '#fff', display: 'flex', flexDirection: 'column', alignItems: 'center', paddingTop: 12 }}>
+        <Tooltip title="展开溯源面板" placement="left"><Button type="text" size="small" icon={<LeftOutlined />} onClick={onToggle} /></Tooltip>
+        <div style={{ writingMode: 'vertical-rl', color: '#666', fontSize: 12, marginTop: 16 }}>文档溯源</div>
+      </div>
+    )
+  }
+  const floatingLeft = floatingPos.x !== null ? floatingPos.x : (window.innerWidth - floatingWidth)
+  const floatingTop = floatingPos.y || 0
+  const panelStyle = isPinned
+    ? (
+        contentAdaptive
+          // 患者详情 Schema 模式：右侧溯源区块随页面滚动，滚到顶部后吸附在视口顶部，始终可见
+          ? {
+              width,
+              background: '#fff',
+              display: 'flex',
+              flexDirection: 'column',
+              position: 'sticky',
+              top: 56,                 // 与 Schema 左侧树的 sticky 顶部对齐
+              alignSelf: 'flex-start',
+              maxHeight: 'calc(100vh - 56px)',
+              overflow: 'hidden',
+              zIndex: 1,
+            }
+          // 其他场景保持原有“占满父容器高度”的固定布局
+          : {
+              width,
+              height: '100%',
+              background: '#fff',
+              display: 'flex',
+              flexDirection: 'column',
+              overflow: 'hidden',
+            }
+      )
+    : {
+        position: 'fixed',
+        left: floatingLeft,
+        top: floatingTop,
+        width: floatingWidth,
+        height: `calc(100vh - ${floatingTop}px)`,
+        background: '#fff',
+        borderRadius: '8px 0 0 8px',
+        boxShadow: isDragging ? '0 8px 32px rgba(0, 0, 0, 0.25)' : '-4px 0 20px rgba(0, 0, 0, 0.12)',
+        zIndex: 1000,
+        display: 'flex',
+        flexDirection: 'column',
+        overflow: 'hidden',
+        transition: isDragging ? 'none' : 'box-shadow 0.3s ease'
+      }
+  const previewFileUrl = previewUrl && previewFileType === 'pdf'
+    ? `${previewUrl}${previewUrl.includes('#') ? '&' : '#'}page=${Math.max(0, sourcePageIdx) + 1}`
+    : previewUrl
+  // 只要是 PDF 且有 sourceDocId，就统一走同源 pdf-stream 接口，便于 PDF.js 渲染
+  const usePdfStream = previewFileType === 'pdf' && sourceDocId
+  const previewDocument = {
+    fileName:
+      displaySource?.document_type ?? displaySource?.source_document_name ??
+      (sourceDocId ? `文档 ${String(sourceDocId).slice(0, 8)}` : '文档预览'),
+    fileType: previewFileType || 'image',
+    fileUrl: usePdfStream ? getDocumentPdfStreamUrl(sourceDocId) : (previewFileUrl || null)
+  }
+  const sourceDocumentName =
+    displaySource?.source_document_name ||
+    displaySource?.document_name ||
+    displaySource?.file_name ||
+    displaySource?.fileName ||
+    (sourceDocId && fallbackDoc ? formatDocumentName(fallbackDoc) : '')
+  return (
+    <div style={panelStyle} data-source-panel>
+      <div style={{ height: 41, padding: '0 12px', borderBottom: '1px solid #f0f0f0', background: '#fff', display: 'flex', justifyContent: 'space-between', alignItems: 'center', flexShrink: 0 }}>
+        <div style={{ display: 'flex', alignItems: 'center', minWidth: 0, flex: 1, marginRight: 8 }}>
+          <Space size={6} style={{ minWidth: 0 }}>
+            <FileTextOutlined style={{ color: '#1890ff' }} />
+            <Text strong style={{ fontSize: 14, flexShrink: 0 }}>文档溯源</Text>
+            {sourceDocumentName ? (
+              <Tooltip title={sourceDocumentName}>
+                <Text
+                  type="secondary"
+                  style={{
+                    fontSize: 12,
+                    maxWidth: 180,
+                    overflow: 'hidden',
+                    textOverflow: 'ellipsis',
+                    whiteSpace: 'nowrap',
+                    display: 'inline-block'
+                  }}
+                >
+                  {sourceDocumentName}
+                </Text>
+              </Tooltip>
+            ) : null}
+          </Space>
+        </div>
+        <Space size={4} style={{ flexShrink: 0 }}>
+          {sourceDocId && (
+            <Tooltip title="查看原文档">
+              <Button
+                type="text"
+                size="small"
+                icon={<EyeOutlined />}
+                loading={previewLoading}
+                style={HEADER_ICON_BUTTON_STYLE}
+                onClick={() => {
+                  setDocModalDoc({
+                    id: sourceDocId,
+                    fileName: previewDocument.fileName
+                  })
+                  setDocModalOpen(true)
+                }}
+              />
+            </Tooltip>
+          )}
+          <Tooltip title="收起面板">
+            <Button
+              type="text"
+              size="small"
+              aria-label="收起文档溯源面板"
+              icon={<RightOutlined />}
+              onClick={onToggle}
+              style={HEADER_ICON_BUTTON_STYLE}
+            />
+          </Tooltip>
+        </Space>
+      </div>
+      <div className="schema-form-scrollable hover-scrollbar scroll-edge-hint" style={{ flex: 1, minHeight: 0, overflowY: 'auto', overflowX: 'hidden' }}>
+        <SourceDocumentPreview documentInfo={previewDocument} activeCoordinates={effectiveCoordinates} panelWidth={effectivePanelWidth} loading={previewLoading} />
+        <div style={{ padding: 12 }}>
+          {selectedField ? (
+            <>
+              <ModificationHistory
+                fieldPath={selectedField.path}
+                rowUid={selectedField.rowUid}
+                patientId={patientId}
+                projectId={projectId}
+                refreshKey={historyRefreshKey}
+                onCandidateApplied={onCandidateApplied}
+                // 用户主动点击「查看溯源」时，允许对当前记录发起文档请求（包括 revoke 记录）
+                onViewSource={
+                  patientId
+                    ? (item) => {
+                        setSuppressAutoSourceDoc(false)
+                        setSelectedHistoryItem(item)
+                      }
+                    : undefined
+                }
+                onHistoryLoaded={patientId ? handleHistoryLoaded : undefined}
+                isSensitive={isCurrentFieldSensitive}
+              />
+            </>
+          ) : (
+            <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description={<Text type="secondary" style={{ fontSize: 12 }}>点击表单中的字段卡片<br />查看数据来源</Text>} />
+          )}
+        </div>
+      </div>
+      {docModalDoc && (
+        <DocumentDetailModal
+          visible={docModalOpen}
+          document={docModalDoc}
+          onClose={() => {
+            setDocModalOpen(false)
+            setDocModalDoc(null)
+          }}
+        />
+      )}
+    </div>
+  )
+}
+
+const RIGHT_PANEL_WIDTH_KEY = 'schemaFormRightPanelWidth'
+const LEFT_PANEL_WIDTH_KEY = 'schemaFormLeftPanelWidth'
+const LEGACY_MIDDLE_PANEL_WIDTH_KEY = 'schemaFormMiddlePanelWidth'
+const DEFAULT_LEFT_PANEL_WIDTH = 240
+const MIN_RIGHT_PANEL_WIDTH = 240
+const MIN_LEFT_PANEL_WIDTH = 180
+const FALLBACK_VIEWPORT_WIDTH = 1440
+/**
+ * 获取当前视口宽度（用于动态计算分栏宽度边界）。
+ * @returns {number}
+ */
+const getViewportWidth = () => (typeof window !== 'undefined' ? window.innerWidth : FALLBACK_VIEWPORT_WIDTH)
+/**
+ * 读取本地存储，失败时返回 null（兼容隐私模式或受限环境）。
+ * @param {string} key
+ * @returns {string|null}
+ */
+const safeStorageGet = (key) => {
+  if (typeof window === 'undefined') return null
+  try {
+    return localStorage.getItem(key)
+  } catch {
+    return null
+  }
+}
+/**
+ * 写入本地存储，失败时静默忽略，避免交互中断。
+ * @param {string} key
+ * @param {string} value
+ */
+const safeStorageSet = (key, value) => {
+  if (typeof window === 'undefined') return
+  try {
+    localStorage.setItem(key, value)
+  } catch {
+    // ignore storage write errors
+  }
+}
+/**
+ * 删除本地存储键，失败时静默忽略。
+ * @param {string} key
+ */
+const safeStorageRemove = (key) => {
+  if (typeof window === 'undefined') return
+  try {
+    localStorage.removeItem(key)
+  } catch {
+    // ignore storage remove errors
+  }
+}
+/**
+ * 计算右侧溯源栏默认宽度。
+ * @returns {number}
+ */
+const getDefaultRightPanelWidth = () => Math.round(getViewportWidth() * 0.25)
+/**
+ * 计算左栏最大宽度（随视口动态变化）。
+ * @returns {number}
+ */
+const getMaxLeftPanelWidth = () => Math.round(getViewportWidth() * 0.38)
+/**
+ * 计算右栏最大宽度（随视口动态变化）。
+ * @returns {number}
+ */
+const getMaxRightPanelWidth = () => Math.round(getViewportWidth() * 0.4)
+/**
+ * 约束左栏宽度到合法区间。
+ * @param {number} width
+ * @returns {number}
+ */
+const clampLeftPanelWidth = (width) => Math.min(getMaxLeftPanelWidth(), Math.max(MIN_LEFT_PANEL_WIDTH, width))
+/**
+ * 约束右栏宽度到合法区间。
+ * @param {number} width
+ * @returns {number}
+ */
+const clampRightPanelWidth = (width) => Math.min(getMaxRightPanelWidth(), Math.max(MIN_RIGHT_PANEL_WIDTH, width))
+const HEADER_ICON_BUTTON_STYLE = {
+  width: 24,
+  minWidth: 24,
+  height: 24,
+  padding: 0,
+  borderRadius: 6,
+  border: '1px solid #d9e1ea',
+  color: '#5f6b7a'
+}
+const COLUMN_RESIZE_BAR_STYLE = {
+  width: 6,
+  flexShrink: 0,
+  cursor: 'col-resize',
+  background: 'transparent',
+  alignSelf: 'stretch'
+}
+/**
+ * 三栏主容器统一分隔线样式（通过绝对定位覆盖全高）。
+ * @type {import('react').CSSProperties}
+ */
+const DIVIDER_LINE_STYLE = {
+  position: 'absolute',
+  top: 0,
+  bottom: 0,
+  width: 1,
+  background: '#f0f0f0',
+  pointerEvents: 'none',
+  zIndex: 4
+}
+const SchemaFormInner = ({ onSave, onReset, onFieldCandidateSolidified, externalHistoryRefreshKey = 0, autoSaveInterval = 30000, siderWidth = 220, sourcePanelWidth, collapsible = true, showSourcePanel = true, projectMode = false, projectConfig = null, projectId = null, patientId = null, contentAdaptive = false, leftHeader = null, collapsedTitle = '目录', onToolbarUploadDocument = null, beforeUploadActions = null }) => {
+  const { state, actions, draftData, patientData, isDirty } = useSchemaForm()
+  const [leftCollapsed, setLeftCollapsed] = useState(false)
+  const [rightCollapsed, setRightCollapsed] = useState(true)
+  const [saving, setSaving] = useState(false)
+  const [autoSaveEnabled, setAutoSaveEnabled] = useState(true)
+  const [selectedField, setSelectedField] = useState(null)
+  const [activeCoordinates, setActiveCoordinates] = useState(null)
+  const [leaveConfirmOpen, setLeaveConfirmOpen] = useState(false)
+  const [historyRefreshKey, setHistoryRefreshKey] = useState(0) // 用于触发修改历史刷新
+  const leaveResolveRef = useRef(null)
+  const pendingPathRef = useRef(null)
+  const [leftPanelWidth, setLeftPanelWidth] = useState(() => {
+    const saved = safeStorageGet(LEFT_PANEL_WIDTH_KEY)
+    if (saved) {
+      const n = parseInt(saved, 10)
+      if (!Number.isNaN(n)) return clampLeftPanelWidth(n)
+    }
+    return clampLeftPanelWidth(siderWidth || DEFAULT_LEFT_PANEL_WIDTH)
+  })
+  // 右侧文档溯源面板宽度（可拖拽调整）
+  const [rightPanelWidth, setRightPanelWidth] = useState(() => {
+    const saved = safeStorageGet(RIGHT_PANEL_WIDTH_KEY)
+    if (saved) {
+      const n = parseInt(saved, 10)
+      if (!Number.isNaN(n)) return clampRightPanelWidth(n)
+    }
+    return clampRightPanelWidth(sourcePanelWidth ?? getDefaultRightPanelWidth())
+  })
+  const rightPanelResizeStart = useRef({ x: 0, w: 0 })
+  const rightPanelLastWidthRef = useRef(rightPanelWidth)
+  const leftPanelLastWidthRef = useRef(leftPanelWidth)
+  const leftPanelResizeStart = useRef({ x: 0, w: 0 })
+  const [extractModalOpen, setExtractModalOpen] = useState(false)
+  const [extractMode, setExtractMode] = useState('existing')
+  const [selectedExtractDocId, setSelectedExtractDocId] = useState(null)
+  const [selectedUploadFile, setSelectedUploadFile] = useState(null)
+  const [isLeftPanelResizing, setIsLeftPanelResizing] = useState(false)
+  const [isRightPanelResizing, setIsRightPanelResizing] = useState(false)
+  const mergedHistoryRefreshKey = historyRefreshKey + Number(externalHistoryRefreshKey || 0)
+  const handleLeftPanelResizeStart = useCallback((e) => {
+    if (leftCollapsed) return
+    e.preventDefault()
+    setIsLeftPanelResizing(true)
+    leftPanelResizeStart.current = { x: e.clientX, w: leftPanelWidth }
+    const onMouseMove = (ev) => {
+      const delta = ev.clientX - leftPanelResizeStart.current.x
+      const newW = clampLeftPanelWidth(leftPanelResizeStart.current.w + delta)
+      leftPanelLastWidthRef.current = newW
+      setLeftPanelWidth(newW)
+    }
+    const onMouseUp = () => {
+      document.removeEventListener('mousemove', onMouseMove)
+      document.removeEventListener('mouseup', onMouseUp)
+      document.body.style.cursor = ''
+      document.body.style.userSelect = ''
+      setIsLeftPanelResizing(false)
+      safeStorageSet(LEFT_PANEL_WIDTH_KEY, String(leftPanelLastWidthRef.current))
+    }
+    document.body.style.cursor = 'col-resize'
+    document.body.style.userSelect = 'none'
+    document.addEventListener('mousemove', onMouseMove)
+    document.addEventListener('mouseup', onMouseUp)
+  }, [leftCollapsed, leftPanelWidth])
+  const handleRightPanelResizeStart = useCallback((e) => {
+    e.preventDefault()
+    setIsRightPanelResizing(true)
+    rightPanelResizeStart.current = { x: e.clientX, w: rightPanelWidth }
+    const onMouseMove = (ev) => {
+      const delta = ev.clientX - rightPanelResizeStart.current.x
+      const newW = clampRightPanelWidth(rightPanelResizeStart.current.w - delta)
+      rightPanelLastWidthRef.current = newW
+      setRightPanelWidth(newW)
+    }
+    const onMouseUp = () => {
+      document.removeEventListener('mousemove', onMouseMove)
+      document.removeEventListener('mouseup', onMouseUp)
+      document.body.style.cursor = ''
+      document.body.style.userSelect = ''
+      setIsRightPanelResizing(false)
+      safeStorageSet(RIGHT_PANEL_WIDTH_KEY, String(rightPanelLastWidthRef.current))
+    }
+    document.body.style.cursor = 'col-resize'
+    document.body.style.userSelect = 'none'
+    document.addEventListener('mousemove', onMouseMove)
+    document.addEventListener('mouseup', onMouseUp)
+  }, [rightPanelWidth])
+  const { documents: projectDocuments = [], selectedDocument = null, onDocumentSelect, onUploadDocument, onAddRepeatableInstance, repeatableNamingPattern = '{formName}_{index}' } = projectConfig || {}
+  const targetSection = useMemo(() => {
+    if (!state?.selectedPath) return null
+    const parts = state.selectedPath.split('.')
+    return parts.slice(0, Math.min(parts.length, 2)).join('.')
+  }, [state?.selectedPath])
+  const extractCandidateDocuments = useMemo(
+    () => buildCandidateDocuments(draftData, projectDocuments),
+    [draftData, projectDocuments]
+  )
+  const selectedExtractDocument = useMemo(
+    () => extractCandidateDocuments.find((doc) => String(doc?.id) === String(selectedExtractDocId)) || null,
+    [extractCandidateDocuments, selectedExtractDocId]
+  )
+  const handleOpenExtractModal = useCallback(() => {
+    setExtractMode(extractCandidateDocuments.length > 0 ? 'existing' : 'upload')
+    setExtractModalOpen(true)
+  }, [extractCandidateDocuments.length])
+  const handleCloseExtractModal = useCallback(() => {
+    setExtractModalOpen(false)
+    setSelectedUploadFile(null)
+  }, [])
+  const handlePickUploadFile = useCallback((file) => {
+    setSelectedUploadFile(file)
+    return false
+  }, [])
+  const handleConfirmExtract = useCallback(() => {
+    if (!patientId) {
+      message.warning('缺少患者信息，暂无法执行文档抽取')
+      return
+    }
+    if (!targetSection) {
+      message.warning('请先在左侧选择目标字段组')
+      return
+    }
+    if (extractMode === 'existing') {
+      if (!selectedExtractDocument) {
+        message.warning('请先选择一个现有文档')
+        return
+      }
+      message.info(`前端占位：已选择文档「${getDocumentDisplayName(selectedExtractDocument)}」，字段组「${targetSection}」，待后端抽取接口接入。`)
+      setExtractModalOpen(false)
+      return
+    }
+    if (!selectedUploadFile) {
+      message.warning('请先选择要上传的文档')
+      return
+    }
+    message.info(`前端占位：将上传「${selectedUploadFile.name}」并绑定患者 ${patientId}，字段组「${targetSection}」，待后端抽取链路接入。`)
+    setExtractModalOpen(false)
+    setSelectedUploadFile(null)
+  }, [extractMode, patientId, targetSection, selectedExtractDocument, selectedUploadFile])
+  const documentExtractToolbarAction = (
+    <Button
+      size="small"
+      icon={<DatabaseOutlined />}
+      onClick={handleOpenExtractModal}
+      style={{
+        ...HEADER_ICON_BUTTON_STYLE,
+        width: 'auto',
+        minWidth: 72,
+        padding: '0 8px'
+      }}
+    >
+      文档抽取
+    </Button>
+  )
+  const handleSave = useCallback(async (type = 'manual') => {
+    if (!isDirty && type === 'manual') { message.info('没有需要保存的修改'); return }
+    setSaving(true)
+    try {
+      if (onSave) await onSave(draftData, type)
+      actions.markSaved()
+      setHistoryRefreshKey(k => k + 1) // 保存成功后触发历史刷新
+      if (type === 'manual') message.success('保存成功')
+      else message.info('自动保存成功', 1)
+    } catch (error) { message.error('保存失败: ' + (error.message || '未知错误')) }
+    finally { setSaving(false) }
+  }, [isDirty, draftData, onSave, actions])
+  const handleReset = useCallback(() => {
+    Modal.confirm({ title: '确认重置', icon: <ExclamationCircleOutlined />, content: '重置后将丢失所有未保存的修改，确定要重置吗？', okText: '确定重置', cancelText: '取消', okButtonProps: { danger: true }, onOk: () => { actions.setPatientData(patientData); if (onReset) onReset(); message.success('已重置为原始数据') } })
+  }, [patientData, actions, onReset])
+  // 切换左侧目录前确认：有未保存修改时弹窗，返回 Promise<boolean>
+  const onBeforeSelect = useCallback((nextPath) => {
+    if (!isDirty) return Promise.resolve(true)
+    pendingPathRef.current = nextPath
+    setLeaveConfirmOpen(true)
+    return new Promise((resolve) => {
+      leaveResolveRef.current = resolve
+    })
+  }, [isDirty])
+  // 清空其他表单前确认：有未保存修改时同「切换表单」逻辑（保存/不保存/取消）
+  const onBeforeClearForm = useCallback(() => {
+    if (!isDirty) return Promise.resolve(true)
+    setLeaveConfirmOpen(true)
+    return new Promise((resolve) => {
+      leaveResolveRef.current = resolve
+    })
+  }, [isDirty])
+  const handleLeaveConfirmSave = useCallback(async () => {
+    setSaving(true)
+    try {
+      if (onSave) await onSave(draftData, 'manual')
+      actions.markSaved()
+      setHistoryRefreshKey(k => k + 1) // 保存成功后触发历史刷新
+      message.success('保存成功')
+      leaveResolveRef.current?.(true)
+      leaveResolveRef.current = null
+      setLeaveConfirmOpen(false)
+      pendingPathRef.current = null
+    } catch (error) {
+      message.error('保存失败: ' + (error.message || '未知错误'))
+    } finally {
+      setSaving(false)
+    }
+  }, [draftData, onSave, actions])
+  const handleLeaveConfirmDiscard = useCallback(() => {
+    actions.setPatientData(patientData)
+    leaveResolveRef.current?.(true)
+    leaveResolveRef.current = null
+    setLeaveConfirmOpen(false)
+    pendingPathRef.current = null
+  }, [patientData, actions])
+  const handleLeaveConfirmCancel = useCallback(() => {
+    leaveResolveRef.current?.(false)
+    leaveResolveRef.current = null
+    setLeaveConfirmOpen(false)
+    pendingPathRef.current = null
+  }, [])
+  /** 删除可重复记录后立即调接口保存（无需再点保存） */
+  const persistDataAfterChange = useCallback(async (data) => {
+    setSaving(true)
+    try {
+      if (onSave) await onSave(data, 'manual')
+      actions.setPatientData(data)
+    } finally {
+      setSaving(false)
+    }
+  }, [onSave, actions])
+  /**
+   * 处理中间表单字段选择与溯源图标点击。
+   *
+   * @param {string} path 字段路径。
+   * @param {Record<string, any>} schema 字段 schema。
+   * @param {string} [name] 字段名称。
+   * @param {{ forceOpen?: boolean, trigger?: string }} [options] 触发选项。
+   * @returns {void}
+   */
+  const handleFieldSourceClick = useCallback((path, schema, name, options = {}) => {
+    /**
+     * 根据字段路径回溯重复行 row_uid。
+     * @param {Record<string, any>} sourceData
+     * @param {string} sourcePath
+     * @returns {string|null}
+     */
+    const resolveRowUidByPath = (sourceData, sourcePath) => {
+      const parts = String(sourcePath || '').split('.').filter(Boolean)
+      if (parts.length === 0) return null
+      let node = sourceData
+      let matchedRowUid = null
+      for (const part of parts) {
+        if (/^\d+$/.test(part)) {
+          const index = Number(part)
+          if (!Array.isArray(node) || node[index] == null) break
+          const rowItem = node[index]
+          if (rowItem && typeof rowItem === 'object' && rowItem._row_uid) {
+            matchedRowUid = String(rowItem._row_uid)
+          }
+          node = rowItem
+          continue
+        }
+        if (!node || typeof node !== 'object') break
+        node = node[part]
+      }
+      return matchedRowUid
+    }
+    const inferredRowUid = String(options?.rowUid || '').trim() || resolveRowUidByPath(draftData, path)
+    setSelectedField({ path, schema, name, rowUid: inferredRowUid || null })
+    // 溯源完全由 ehr-v2/history 接口驱动，不再使用抽取 audit 的 bbox 定位；高亮仅在用户从修改历史选择一条后由 source_location.position 提供
+    setActiveCoordinates(null)
+    if (options.forceOpen && rightCollapsed) setRightCollapsed(false)
+  }, [draftData, rightCollapsed])
+  /**
+   * 候选值固化成功后，将值同步回当前表单草稿与已保存快照，避免中间栏展示滞后。
+   *
+   * @param {string} fieldPath 字段路径。
+   * @param {any} value 固化后的字段值。
+   * @returns {void}
+   */
+  const handleCandidateApplied = useCallback((fieldPath, value, rowUid = null) => {
+    if (!fieldPath) return
+    const nextData = JSON.parse(JSON.stringify(draftData || {}))
+    const parts = String(fieldPath).split('.').filter(Boolean)
+    if (parts.length === 0) return
+    let cursor = nextData
+    for (let i = 0; i < parts.length - 1; i += 1) {
+      const part = parts[i]
+      const nextPart = parts[i + 1]
+      const nextIsArray = /^\d+$/.test(nextPart)
+      if (/^\d+$/.test(part)) {
+        const index = parseInt(part, 10)
+        if (!Array.isArray(cursor)) return
+        while (cursor.length <= index) cursor.push(nextIsArray ? [] : {})
+        if (cursor[index] == null || typeof cursor[index] !== 'object') {
+          cursor[index] = nextIsArray ? [] : {}
+        }
+        cursor = cursor[index]
+      } else {
+        if (cursor[part] == null || typeof cursor[part] !== 'object') {
+          cursor[part] = nextIsArray ? [] : {}
+        }
+        cursor = cursor[part]
+      }
+    }
+    const lastKey = parts[parts.length - 1]
+    if (/^\d+$/.test(lastKey)) {
+      const index = parseInt(lastKey, 10)
+      if (!Array.isArray(cursor)) return
+      while (cursor.length <= index) cursor.push(null)
+      cursor[index] = value
+    } else {
+      cursor[lastKey] = value
+    }
+    if (rowUid) {
+      let uidCursor = nextData
+      for (const part of parts) {
+        if (/^\d+$/.test(part)) {
+          const index = parseInt(part, 10)
+          if (!Array.isArray(uidCursor) || !uidCursor[index] || typeof uidCursor[index] !== 'object') {
+            break
+          }
+          uidCursor[index]._row_uid = uidCursor[index]._row_uid || rowUid
+          uidCursor = uidCursor[index]
+          continue
+        }
+        if (!uidCursor || typeof uidCursor !== 'object') {
+          break
+        }
+        uidCursor = uidCursor[part]
+      }
+    }
+    actions.setPatientData(nextData)
+    setHistoryRefreshKey((tick) => tick + 1)
+    if (projectMode && typeof onFieldCandidateSolidified === 'function') {
+      Promise.resolve(onFieldCandidateSolidified({ fieldPath, value, nextData })).catch((error) => {
+        console.error('[SchemaForm] onFieldCandidateSolidified failed:', error)
+      })
+    }
+  }, [actions, draftData, onFieldCandidateSolidified, projectMode])
+  const leftColumnWidth = leftCollapsed ? 52 : leftPanelWidth
+  const leftDividerOffset = leftColumnWidth + (leftCollapsed ? 0 : COLUMN_RESIZE_BAR_STYLE.width)
+  const rightDividerOffset = rightCollapsed ? 32 : rightPanelWidth
+  useAutoSave(autoSaveEnabled, autoSaveInterval, handleSave)
+  useEffect(() => {
+    // 清理历史遗留的中间栏固定宽，确保中间栏始终按剩余空间自适应。
+    safeStorageRemove(LEGACY_MIDDLE_PANEL_WIDTH_KEY)
+  }, [])
+  useEffect(() => {
+    const handleBeforeUnload = (e) => { if (isDirty) { e.preventDefault(); e.returnValue = '' } }
+    window.addEventListener('beforeunload', handleBeforeUnload)
+    return () => window.removeEventListener('beforeunload', handleBeforeUnload)
+  }, [isDirty])
+  return (
+    <div style={{
+      height: contentAdaptive ? 'auto' : '100%',
+      minHeight: contentAdaptive ? 500 : undefined,
+      display: 'flex',
+      flexDirection: 'column',
+      background: '#fff',
+      borderRadius: 0,
+      overflow: contentAdaptive ? 'visible' : 'hidden'
+    }}>
+      {/* Toolbar moved to CategoryTree bottom */}
+      <Modal
+        title="当前修改尚未保存"
+        open={leaveConfirmOpen}
+        onCancel={handleLeaveConfirmCancel}
+        footer={[
+          <Button key="cancel" onClick={handleLeaveConfirmCancel}>取消</Button>,
+          <Button key="discard" onClick={handleLeaveConfirmDiscard}>不保存</Button>,
+          <Button key="save" type="primary" loading={saving} onClick={handleLeaveConfirmSave} icon={<SaveOutlined />}>保存</Button>
+        ]}
+      >
+        <p>当前修改尚未保存。请选择：保存、不保存离开，或取消。</p>
+      </Modal>
+      <Modal
+        title="文档抽取"
+        open={extractModalOpen}
+        onCancel={handleCloseExtractModal}
+        onOk={handleConfirmExtract}
+        okText="确认抽取"
+        cancelText="取消"
+        okButtonProps={{ disabled: !patientId || !targetSection || (extractMode === 'existing' ? !selectedExtractDocument : !selectedUploadFile) }}
+        width={720}
+      >
+        <div style={{ marginBottom: 12, display: 'flex', gap: 8, alignItems: 'center', flexWrap: 'wrap' }}>
+          <Text type="secondary">当前字段组：</Text>
+          <Tag color={targetSection ? 'blue' : 'default'}>{targetSection || '未选择'}</Tag>
+          <Text type="secondary">患者ID：{patientId || '-'}</Text>
+          {projectId && <Text type="secondary">项目ID：{projectId}</Text>}
+        </div>
+        {!targetSection && (
+          <div style={{ marginBottom: 12, padding: '8px 12px', borderRadius: 6, background: '#fffbe6', border: '1px solid #ffe58f', color: '#ad6800' }}>
+            请先在左侧目录中选择目标表单，再进行文档抽取。
+          </div>
+        )}
+        <Tabs
+          activeKey={extractMode}
+          onChange={(key) => setExtractMode(key)}
+          items={[
+            {
+              key: 'existing',
+              label: '选择现有文档',
+              children: (
+                <div className="schema-form-scrollable hover-scrollbar" style={{ maxHeight: 300, overflowY: 'auto', border: '1px solid #f0f0f0', borderRadius: 8 }}>
+                  {extractCandidateDocuments.length === 0 ? (
+                    <Empty
+                      image={Empty.PRESENTED_IMAGE_SIMPLE}
+                      description="暂无可选文档，请切换到“上传文档”"
+                      style={{ margin: '28px 0' }}
+                    />
+                  ) : (
+                    extractCandidateDocuments.map((doc) => {
+                      const docId = String(doc?.id ?? '')
+                      const active = String(selectedExtractDocId) === docId
+                      return (
+                        <button
+                          key={docId || `${getDocumentDisplayName(doc)}_${formatDocumentUploadedAt(doc)}`}
+                          type="button"
+                          onClick={() => setSelectedExtractDocId(docId)}
+                          style={{
+                            width: '100%',
+                            textAlign: 'left',
+                            border: 'none',
+                            borderBottom: '1px solid #f5f5f5',
+                            background: active ? '#e6f7ff' : '#fff',
+                            padding: '10px 12px',
+                            cursor: 'pointer'
+                          }}
+                        >
+                          <div style={{ display: 'flex', justifyContent: 'space-between', gap: 10 }}>
+                            <Text strong style={{ color: active ? '#1677ff' : '#1f1f1f' }}>{getDocumentDisplayName(doc)}</Text>
+                            <Text type="secondary" style={{ whiteSpace: 'nowrap' }}>{formatDocumentUploadedAt(doc)}</Text>
+                          </div>
+                          <Text type="secondary" style={{ fontSize: 12 }}>{getDocumentTypeLabel(doc)}</Text>
+                        </button>
+                      )
+                    })
+                  )}
+                </div>
+              )
+            },
+            {
+              key: 'upload',
+              label: '上传文档',
+              children: (
+                <div style={{ paddingTop: 4 }}>
+                  <Upload
+                    beforeUpload={handlePickUploadFile}
+                    showUploadList={false}
+                    accept=".pdf,.jpg,.jpeg,.png,.doc,.docx"
+                  >
+                    <Button icon={<UploadOutlined />}>选择文档</Button>
+                  </Upload>
+                  <div style={{ marginTop: 12 }}>
+                    {selectedUploadFile ? (
+                      <div style={{ padding: '8px 12px', background: '#f6ffed', border: '1px solid #b7eb8f', borderRadius: 6 }}>
+                        <Text>已选择：{selectedUploadFile.name}</Text>
+                      </div>
+                    ) : (
+                      <Text type="secondary">支持 PDF / 图片 / Word。选择文件后点击“确认抽取”。</Text>
+                    )}
+                  </div>
+                </div>
+              )
+            }
+          ]}
+        />
+      </Modal>
+      <div style={{ flex: contentAdaptive ? 'none' : 1, minHeight: contentAdaptive ? 500 : 0, display: 'flex', overflow: contentAdaptive ? 'visible' : 'hidden', background: '#fff', position: 'relative', alignItems: contentAdaptive ? 'flex-start' : 'stretch' }}>
+        <div style={{ ...DIVIDER_LINE_STYLE, left: leftDividerOffset }} />
+        {showSourcePanel && <div style={{ ...DIVIDER_LINE_STYLE, left: `calc(100% - ${rightDividerOffset}px)` }} />}
+        <div style={{
+          width: leftColumnWidth,
+          transition: 'width 0.2s',
+          overflow: 'hidden',
+          padding: 0,
+          flexShrink: 0,
+          display: 'flex',
+          flexDirection: 'column',
+          ...(contentAdaptive ? { position: 'sticky', top: 56, alignSelf: 'flex-start', zIndex: 2 } : {})
+        }}>
+          <div style={{
+            height: contentAdaptive ? 'auto' : '100%',
+            minHeight: contentAdaptive ? 0 : 0,
+            display: 'flex',
+            flexDirection: 'column',
+            gap: 12,
+            flex: contentAdaptive ? 'none' : 1
+          }}>
+            {contentAdaptive && leftHeader && !leftCollapsed && <div style={{ flexShrink: 0, padding: '0 8px' }}>{leftHeader}</div>}
+            <div style={{ flex: contentAdaptive ? 'none' : 1, minHeight: contentAdaptive ? 0 : 0, overflowX: 'hidden', display: 'flex', flexDirection: 'column' }}>
+              <CategoryTree
+                defaultExpandAll
+                style={{ height: contentAdaptive ? 'auto' : '100%' }}
+                onBeforeSelect={onBeforeSelect}
+                onBeforeClearForm={onBeforeClearForm}
+                onPersistAfterChange={persistDataAfterChange}
+                projectMode={projectMode}
+                projectDocuments={projectDocuments}
+                selectedDocument={selectedDocument}
+                onDocumentSelect={onDocumentSelect}
+                onUploadDocument={onUploadDocument}
+                onAddRepeatableInstance={onAddRepeatableInstance}
+                repeatableNamingPattern={repeatableNamingPattern}
+                patientId={patientId}
+                collapsed={leftCollapsed}
+                onToggleCollapse={() => setLeftCollapsed(!leftCollapsed)}
+                collapsible={collapsible}
+                collapsedTitle={collapsedTitle}
+              />
+            </div>
+          </div>
+        </div>
+        {!leftCollapsed && (
+          <SplitterHandle
+            axis="vertical"
+            thickness={COLUMN_RESIZE_BAR_STYLE.width}
+            isActive={isLeftPanelResizing}
+            showOnHover
+            onMouseDown={handleLeftPanelResizeStart}
+            style={{ alignSelf: 'stretch' }}
+            ariaLabel="拖动调整目录栏宽度"
+          />
+        )}
+        <div
+          style={{
+            flex: 1,
+            overflow: contentAdaptive ? 'visible' : 'hidden',
+            minWidth: 0
+          }}
+        >
+          <FormPanel
+            style={{ height: contentAdaptive ? 'auto' : '100%' }}
+            onFieldSelect={handleFieldSourceClick}
+            toolbarProps={{
+              onSave: handleSave,
+              onReset: handleReset,
+              saving,
+              autoSaveEnabled,
+              onToggleAutoSave: () => setAutoSaveEnabled(!autoSaveEnabled),
+              isDirty
+            }}
+            onUploadDocument={onToolbarUploadDocument}
+            beforeUploadActions={beforeUploadActions}
+            beforeAutoActions={documentExtractToolbarAction}
+          />
+        </div>
+        {showSourcePanel && (
+          <>
+            {!rightCollapsed && (
+              <SplitterHandle
+                axis="vertical"
+                thickness={COLUMN_RESIZE_BAR_STYLE.width}
+                isActive={isRightPanelResizing}
+                showOnHover
+                onMouseDown={handleRightPanelResizeStart}
+                style={{ alignSelf: 'stretch', marginLeft: 2 }}
+                ariaLabel="拖动调整文档溯源面板宽度"
+              />
+            )}
+            <SourcePanel
+              collapsed={rightCollapsed}
+              onToggle={() => setRightCollapsed(!rightCollapsed)}
+              selectedField={selectedField}
+              width={rightPanelWidth}
+              activeCoordinates={activeCoordinates}
+              patientId={patientId}
+              projectId={projectId}
+              historyRefreshKey={mergedHistoryRefreshKey}
+              onRefreshHistory={() => setHistoryRefreshKey(k => k + 1)}
+              onCandidateApplied={handleCandidateApplied}
+              fallbackDocuments={projectDocuments}
+              preferredDocument={selectedDocument}
+              contentAdaptive={contentAdaptive}
+            />
+          </>
+        )}
+      </div>
+    </div>
+  )
+}
+
+const SchemaForm = ({ schema, enums = {}, patientData, patientId, projectId, onSave, onReset, onFieldCandidateSolidified, externalHistoryRefreshKey = 0, loading = false, autoSaveInterval = 30000, siderWidth = 220, sourcePanelWidth, collapsible = true, showSourcePanel = true, projectMode = false, projectConfig = null, contentAdaptive = false, leftHeader = null, collapsedTitle = '目录', style, onUploadDocument = null, beforeUploadActions = null }) => {
+  const resolvedPatientId = patientId || patientData?.id || patientData?.patient_id || null
+  
+  if (loading) return <div style={{ height: '100%', display: 'flex', alignItems: 'center', justifyContent: 'center', ...style }}><Spin tip="加载中..." size="large" /></div>
+  if (!schema) return <div style={{ height: '100%', display: 'flex', alignItems: 'center', justifyContent: 'center', color: '#999', ...style }}>请提供Schema配置</div>
+  return (
+    <div style={{ height: contentAdaptive ? 'auto' : '100%', ...style }}>
+      <SchemaFormProvider schema={schema} enums={enums} patientData={patientData}>
+        <SchemaFormInner onSave={onSave} onReset={onReset} onFieldCandidateSolidified={onFieldCandidateSolidified} externalHistoryRefreshKey={externalHistoryRefreshKey} autoSaveInterval={autoSaveInterval} siderWidth={siderWidth} sourcePanelWidth={sourcePanelWidth} collapsible={collapsible} showSourcePanel={showSourcePanel} projectMode={projectMode} projectConfig={projectConfig} projectId={projectId} patientId={resolvedPatientId} contentAdaptive={contentAdaptive} leftHeader={leftHeader} collapsedTitle={collapsedTitle} onToolbarUploadDocument={onUploadDocument} beforeUploadActions={beforeUploadActions} />
+      </SchemaFormProvider>
+    </div>
+  )
+}
+
+export default SchemaForm

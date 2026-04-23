@@ -67,6 +67,14 @@ class ExtractRequest(BaseModel):
         default="patient_ehr",
         description="实例类型：patient_ehr（病历夹）或 project_crf（科研项目）",
     )
+    target_section: Optional[str] = Field(
+        default=None,
+        description=(
+            "可选：靶向 section 名（形如 '基本信息 / 人口学情况'）。"
+            "若提供则进入靶向模式：仅对该 section 子 schema 抽取，"
+            "忽略 x-sources 子类型匹配，document_ids 原样作为该 section 的唯一文档源。"
+        ),
+    )
 
 
 class ExtractResponse(BaseModel):
@@ -149,6 +157,7 @@ async def submit_extraction(req: ExtractRequest):
         schema_id=actual_schema_id,
         document_ids=req.document_ids,
         instance_type=req.instance_type,
+        target_section=req.target_section,
     )
 
     logger.info(
@@ -254,6 +263,12 @@ class BatchExtractRequest(BaseModel):
     schema_id: str
     document_ids: List[str] = Field(..., description="归档的文档 ID 列表")
     instance_type: str = "patient_ehr"
+    target_section: Optional[str] = Field(
+        default=None,
+        description=(
+            "可选：靶向 section 名。若提供则进入靶向模式（绕过 x-sources 子类型匹配）"
+        ),
+    )
 
 
 @app.post("/api/extract/batch")
@@ -302,6 +317,7 @@ async def submit_batch_extraction(req: BatchExtractRequest):
         schema_id=actual_schema_id,
         document_ids=all_doc_ids,
         instance_type=req.instance_type,
+        target_section=req.target_section,
     )
 
     return {

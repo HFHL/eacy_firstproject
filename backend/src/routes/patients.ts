@@ -1,5 +1,6 @@
 import { Router, Request, Response } from 'express'
 import db from '../db.js'
+import { crfServiceSubmitBatch } from '../services/crfServiceClient.js'
 
 const router = Router()
 
@@ -461,15 +462,11 @@ router.post('/:patientId/ehr-folder/update', async (req: Request, res: Response)
         `[update-ehr-folder] 开始提交抽取任务 patient=${patientId} schema=${schemaRow.id} document_count=${documentIdsToExtract.length}`
       )
 
-      const response = await fetch('http://localhost:8100/api/extract/batch', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          patient_id: patientId,
-          schema_id: schemaRow.id,
-          document_ids: documentIdsToExtract,
-          instance_type: 'patient_ehr'
-        })
+      const response = await crfServiceSubmitBatch({
+        patient_id: patientId,
+        schema_id: schemaRow.id,
+        document_ids: documentIdsToExtract,
+        instance_type: 'patient_ehr'
       })
 
       if (!response.ok) {

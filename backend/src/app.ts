@@ -10,7 +10,7 @@ const UPLOADS_DIR = path.resolve(__dirname, '../uploads')
 const app = express()
 
 app.use(cors())
-app.use(express.json({ limit: '10mb' }))
+app.use(express.json({ limit: '10mb', strict: false }))
 app.use(express.urlencoded({ extended: true }))
 
 // 静态文件 serve — 文档预览使用

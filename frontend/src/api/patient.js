@@ -115,9 +115,13 @@ export const getEhrFieldHistory = async (patientId, fieldId) => {
     return { success: false, code: 500, message: error.message, data: { history: [] } }
   }
 }
-export const getEhrFieldHistoryV2 = async (patientId, fieldPath) => {
+export const getEhrFieldHistoryV2 = async (patientId, fieldPath, options = {}) => {
   try {
-    const response = await fetch(`/api/v1/patients/${patientId}/ehr-field-history?field_path=${encodeURIComponent(fieldPath)}`)
+    const qs = new URLSearchParams()
+    qs.set('field_path', fieldPath)
+    const projectId = options?.projectId
+    if (projectId) qs.set('project_id', String(projectId))
+    const response = await fetch(`/api/v1/patients/${encodeURIComponent(patientId)}/ehr-field-history?${qs.toString()}`)
     return await response.json()
   } catch (error) {
     console.error('获取字段历史失败:', error)

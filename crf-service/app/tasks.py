@@ -18,6 +18,7 @@ from pathlib import Path
 from typing import Any, Dict, Optional
 
 import redis
+from celery.exceptions import SoftTimeLimitExceeded
 
 from app.celery_app import celery_app
 from app.config import settings
@@ -25,6 +26,12 @@ from app.graph.builder import build_graph
 from app.repo.db import CRFRepo, _now_iso
 
 logger = logging.getLogger("crf-service.tasks")
+
+# 抽取任务最长允许执行时间（秒）
+# - soft：到点抛 SoftTimeLimitExceeded，给一次机会做 DB 清理
+# - hard：再宽限 2 分钟，Celery 直接 SIGKILL worker 子进程
+EXTRACTION_SOFT_TIME_LIMIT_SEC = 20 * 60
+EXTRACTION_HARD_TIME_LIMIT_SEC = EXTRACTION_SOFT_TIME_LIMIT_SEC + 2 * 60
 
 
 def _get_redis_client() -> redis.Redis:
@@ -45,9 +52,10 @@ def _publish_progress(job_id: str, data: Dict[str, Any]) -> None:
 @celery_app.task(
     bind=True,
     name="crf.run_extraction",
-    max_retries=3,
-    default_retry_delay=30,
+    max_retries=0,  # 抽取失败不自动重试（老的重试逻辑因 fail_job 已先于 retry 写入 failed 导致 claim 总返回 false，实际从未生效）
     acks_late=True,
+    soft_time_limit=EXTRACTION_SOFT_TIME_LIMIT_SEC,
+    time_limit=EXTRACTION_HARD_TIME_LIMIT_SEC,
 )
 def run_extraction_task(
     self,
@@ -57,6 +65,7 @@ def run_extraction_task(
     schema_id: str,
     document_ids: Optional[list] = None,
     instance_type: str = "patient_ehr",
+    target_section: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
     Celery task：执行完整的 CRF 抽取 pipeline。
@@ -80,11 +89,27 @@ def run_extraction_task(
         "message": "抽取任务已开始",
     })
 
-    # Claim primary job（如果有 job_id）
+    # Claim primary + sibling jobs（同批次所有 pending 任务都要 claim，避免僵死）
     if job_id:
         try:
             with repo.connect() as conn:
                 claimed = repo.claim_job(conn, job_id)
+                if document_ids and len(document_ids) > 1:
+                    placeholders = ",".join(["?"] * len(document_ids))
+                    conn.execute(
+                        f"""
+                        UPDATE ehr_extraction_jobs
+                        SET status = 'running',
+                            attempt_count = attempt_count + 1,
+                            started_at = COALESCE(started_at, ?),
+                            updated_at = ?
+                        WHERE document_id IN ({placeholders})
+                          AND schema_id = ?
+                          AND status = 'pending'
+                          AND id != ?
+                        """,
+                        (_now_iso(), _now_iso(), *document_ids, schema_id, job_id),
+                    )
                 conn.commit()
             if not claimed:
                 logger.warning("[task] job 无法 claim: %s", job_id)
@@ -102,6 +127,8 @@ def run_extraction_task(
     }
     if document_ids:
         initial_state["document_ids"] = document_ids
+    if target_section:
+        initial_state["target_section"] = target_section
 
     # 执行 LangGraph 图
     try:
@@ -117,38 +144,27 @@ def run_extraction_task(
             "status": "completed",
             "materialized": final_state.get("materialized", False),
             "instance_id": final_state.get("instance_id"),
+            "materialized_document_ids": final_state.get("materialized_document_ids") or [],
             "unit_count": len(final_state.get("unit_results") or []),
             "pipeline_report": final_state.get("pipeline_report", ""),
             "errors": final_state.get("errors", []),
             "elapsed_ms": elapsed_ms,
         }
 
-        # 更新所有相关 job 状态（批量模式下包含多个文档的 job）
+        # 按"实际物化的文档"精准更新 job 状态，其余 sibling 文档标 skipped。
+        # 修复 P3（sibling 僵死）+ P14（doc.extract_status 与 job.status 不一致）。
         if job_id:
             try:
-                instance_id = final_state.get("instance_id")
-                with repo.connect() as conn:
-                    # 完成 primary job
-                    repo.complete_job(conn, job_id, instance_id)
-                    # 批量完成同批次中其他文档的 pending/running jobs
-                    if document_ids and len(document_ids) > 1:
-                        placeholders = ",".join(["?"] * len(document_ids))
-                        conn.execute(
-                            f"""
-                            UPDATE ehr_extraction_jobs
-                            SET status = 'completed',
-                                completed_at = ?,
-                                result_extraction_run_id = COALESCE(?, result_extraction_run_id),
-                                updated_at = ?
-                            WHERE document_id IN ({placeholders})
-                              AND schema_id = ?
-                              AND status IN ('pending', 'running')
-                              AND id != ?
-                            """,
-                            (_now_iso(), instance_id, _now_iso(), *document_ids, schema_id, job_id),
-                        )
-                    conn.commit()
-                logger.info("[task] 已完成 job=%s 及其关联 jobs", job_id)
+                _finalize_jobs_by_outcome(
+                    repo=repo,
+                    primary_job_id=job_id,
+                    document_ids=document_ids or [],
+                    schema_id=schema_id,
+                    instance_id=final_state.get("instance_id"),
+                    materialized_doc_ids=set(final_state.get("materialized_document_ids") or []),
+                    pipeline_report=final_state.get("pipeline_report", ""),
+                )
+                logger.info("[task] 已同步 job + document 状态 primary=%s", job_id)
             except Exception as exc:
                 logger.error("[task] 更新 job 状态失败: %s", exc)
 
@@ -162,34 +178,42 @@ def run_extraction_task(
         logger.info("[task] 完成 job=%s elapsed=%dms", actual_job_id, elapsed_ms)
         return result
 
+    except SoftTimeLimitExceeded as exc:
+        # 超过 20 分钟软超时：视为最终失败，不自动重试
+        elapsed_ms = int((time.time() - t0) * 1000)
+        error_msg = f"抽取超时：运行 {elapsed_ms // 1000}s 未完成（软超时 {EXTRACTION_SOFT_TIME_LIMIT_SEC}s）"
+        logger.error("[task] 抽取超时 job=%s elapsed=%dms", actual_job_id, elapsed_ms)
+        _mark_extraction_failed(
+            repo=repo,
+            job_id=job_id,
+            document_ids=document_ids,
+            schema_id=schema_id,
+            error_msg=error_msg,
+        )
+        _publish_progress(actual_job_id, {
+            "status": "failed",
+            "node": "timeout",
+            "message": error_msg,
+        })
+        return {
+            "job_id": actual_job_id,
+            "patient_id": patient_id,
+            "schema_id": schema_id,
+            "status": "failed",
+            "reason": "soft_time_limit",
+            "elapsed_ms": elapsed_ms,
+        }
+
     except Exception as exc:
         logger.exception("[task] 抽取异常 job=%s", actual_job_id)
 
-        # 更新所有相关 job 失败状态
-        if job_id:
-            try:
-                with repo.connect() as conn:
-                    repo.fail_job(conn, job_id, str(exc))
-                    # 批量标记同批次其他 jobs 为 failed
-                    if document_ids and len(document_ids) > 1:
-                        placeholders = ",".join(["?"] * len(document_ids))
-                        conn.execute(
-                            f"""
-                            UPDATE ehr_extraction_jobs
-                            SET status = 'failed',
-                                last_error = ?,
-                                completed_at = ?,
-                                updated_at = ?
-                            WHERE document_id IN ({placeholders})
-                              AND schema_id = ?
-                              AND status IN ('pending', 'running')
-                              AND id != ?
-                            """,
-                            (str(exc)[:4000], _now_iso(), _now_iso(), *document_ids, schema_id, job_id),
-                        )
-                    conn.commit()
-            except Exception:
-                pass
+        _mark_extraction_failed(
+            repo=repo,
+            job_id=job_id,
+            document_ids=document_ids,
+            schema_id=schema_id,
+            error_msg=str(exc),
+        )
 
         _publish_progress(actual_job_id, {
             "status": "failed",
@@ -197,8 +221,125 @@ def run_extraction_task(
             "message": f"抽取失败: {exc}",
         })
 
-        # Celery 自动重试
-        raise self.retry(exc=exc)
+        # 失败即终态，不再重试
+        return {
+            "job_id": actual_job_id,
+            "patient_id": patient_id,
+            "schema_id": schema_id,
+            "status": "failed",
+            "error": str(exc),
+        }
+
+
+def _finalize_jobs_by_outcome(
+    *,
+    repo: CRFRepo,
+    primary_job_id: str,
+    document_ids: list,
+    schema_id: str,
+    instance_id: Optional[str],
+    materialized_doc_ids: set,
+    pipeline_report: str,
+) -> None:
+    """
+    按"是否真的被物化"分类收尾：
+
+      - 物化到的文档对应 job  → completed
+      - 同批次里没物化到的文档（x-sources 不匹配 / 没产出结果）→ completed（reason=no_match）
+        其实际的 document.extract_status 维持 pending/skipped，避免把"空抽取"误报为成功。
+      - 失败由 _mark_extraction_failed 单独处理，不走这里。
+
+    这样保证 ehr_extraction_jobs.status 一定推进到终态（不再僵死 pending），
+    同时 documents.extract_status 只有真正跑出数据的才会被 mark_extract_success。
+    """
+    note = (pipeline_report or "")[:500]
+    materialized = set(materialized_doc_ids or [])
+
+    with repo.connect() as conn:
+        # 1) primary job 结果
+        if primary_job_id in {row["id"] for row in conn.execute(
+            "SELECT id FROM ehr_extraction_jobs WHERE id = ?", (primary_job_id,)
+        ).fetchall()}:
+            repo.complete_job(conn, primary_job_id, instance_id)
+
+        if document_ids and len(document_ids) > 1:
+            placeholders = ",".join(["?"] * len(document_ids))
+            # 2) 对同批次中 **命中物化的文档** 对应的 sibling job → completed
+            if materialized:
+                m_placeholders = ",".join(["?"] * len(materialized))
+                conn.execute(
+                    f"""
+                    UPDATE ehr_extraction_jobs
+                    SET status = 'completed',
+                        completed_at = ?,
+                        result_extraction_run_id = COALESCE(?, result_extraction_run_id),
+                        last_error = NULL,
+                        updated_at = ?
+                    WHERE document_id IN ({m_placeholders})
+                      AND schema_id = ?
+                      AND status IN ('pending', 'running')
+                      AND id != ?
+                    """,
+                    (_now_iso(), instance_id, _now_iso(), *materialized, schema_id, primary_job_id),
+                )
+            # 3) 没命中的 sibling job：也推进到 completed（reason 写 last_error 避免 UI 误解为失败）
+            conn.execute(
+                f"""
+                UPDATE ehr_extraction_jobs
+                SET status = 'completed',
+                    completed_at = ?,
+                    last_error = ?,
+                    updated_at = ?
+                WHERE document_id IN ({placeholders})
+                  AND schema_id = ?
+                  AND status IN ('pending', 'running')
+                  AND id != ?
+                """,
+                (
+                    _now_iso(),
+                    (f"no_match: {note}" if note else "no_match"),
+                    _now_iso(),
+                    *document_ids,
+                    schema_id,
+                    primary_job_id,
+                ),
+            )
+        conn.commit()
+
+
+def _mark_extraction_failed(
+    *,
+    repo: CRFRepo,
+    job_id: Optional[str],
+    document_ids: Optional[list],
+    schema_id: str,
+    error_msg: str,
+) -> None:
+    """把 primary job + 同批次 sibling jobs 全部标记为 failed。"""
+    if not job_id:
+        return
+    try:
+        with repo.connect() as conn:
+            repo.fail_job(conn, job_id, error_msg)
+            if document_ids and len(document_ids) > 1:
+                placeholders = ",".join(["?"] * len(document_ids))
+                conn.execute(
+                    f"""
+                    UPDATE ehr_extraction_jobs
+                    SET status = 'failed',
+                        last_error = ?,
+                        completed_at = ?,
+                        updated_at = ?
+                    WHERE document_id IN ({placeholders})
+                      AND schema_id = ?
+                      AND status IN ('pending', 'running')
+                      AND id != ?
+                    """,
+                    (error_msg[:4000], _now_iso(), _now_iso(), *document_ids, schema_id, job_id),
+                )
+            conn.commit()
+    except Exception:
+        logger.exception("[task] 标记 job 失败时出错 job=%s", job_id)
 
 
 # ── 流水线 Tasks ─────────────────────────────────────────────────────────────

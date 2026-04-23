@@ -19,6 +19,9 @@ class CRFExtractionState(TypedDict, total=False):
     schema_id: str
     document_ids: List[str]             # 可选：指定文档 ID，否则按 patient 自动匹配
     instance_type: str                  # "patient_ehr" | "project_crf"
+    target_section: Optional[str]       # 可选：靶向 section（形如 "基本信息 / 人口学情况"）。
+                                        # 若提供：filter_units 直接裁出该 section 子 schema，
+                                        # document_ids 原样传入该唯一 unit，**不**做 x-sources 子类型匹配。
 
     # ── load_schema_and_docs 节点输出 ────────────────────────────────────
     schema_content: Dict[str, Any]      # schemas.content_json parsed
@@ -37,6 +40,7 @@ class CRFExtractionState(TypedDict, total=False):
     # ── materialize 节点输出 ─────────────────────────────────────────────
     instance_id: Optional[str]               # 物化后的 schema_instances.id
     materialized: bool
+    materialized_document_ids: List[str]     # 本次实际成功物化的文档 id，用于精准同步 job/doc 状态
 
     # ── 全局 ─────────────────────────────────────────────────────────────
     errors: List[str]

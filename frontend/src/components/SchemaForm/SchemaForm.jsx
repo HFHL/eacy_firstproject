@@ -58,7 +58,6 @@ import FormPanel from './FormPanel'
 import { getDocumentDetail, getDocumentTempUrl, getDocumentPdfStreamUrl, uploadAndArchiveAsync, getDocumentTaskProgress } from '../../api/document'
 import { getEhrFieldHistoryV2, getFieldConflicts, resolveFieldConflict } from '../../api/patient'
 import PdfPageWithHighlight from '../PdfPageWithHighlight'
-import { getProjectCrfFieldHistory } from '../../api/project'
 import { upsertTask, getTasksByScope } from '../../utils/taskStore'
 import { maskSensitiveField } from '../../utils/sensitiveUtils'
 import {
@@ -220,30 +219,14 @@ const ModificationHistory = ({ fieldPath, patientId, projectId, refreshKey = 0, 
         if (typeof onHistoryLoaded === 'function') onHistoryLoaded([])
         return
       }
-      if (projectId && patientId) {
-        // 科研项目模式：调用项目专用历史 API（后端会做路径归一化）
+      if (patientId) {
         setLoading(true)
         try {
-          const res = await getProjectCrfFieldHistory(projectId, patientId, fieldPath)
-          const list = !cancelled && res?.data?.history ? res.data.history : []
-          if (!cancelled) {
-            setHistory(list)
-            if (typeof onHistoryLoaded === 'function') onHistoryLoaded(list)
-          }
-        } catch (e) {
-          console.error('Failed to fetch project field history:', e)
-          if (!cancelled) {
-            setHistory([])
-            if (typeof onHistoryLoaded === 'function') onHistoryLoaded([])
-          }
-        } finally {
-          if (!cancelled) setLoading(false)
-        }
-      } else if (patientId) {
-        // 患者数据池模式：调用 EHR V2 历史 API
-        setLoading(true)
-        try {
-          const res = await getEhrFieldHistoryV2(patientId, fieldPath)
+          const res = await getEhrFieldHistoryV2(
+            patientId,
+            fieldPath,
+            projectId ? { projectId } : {}
+          )
           const list = !cancelled && res?.data?.history ? res.data.history : []
           if (!cancelled) {
             setHistory(list)
@@ -321,6 +304,13 @@ const ModificationHistory = ({ fieldPath, patientId, projectId, refreshKey = 0, 
     if (item.change_type === 'initial_extract' || item.operator_type === 'system') {
       return { color: 'default', label: '系统初始化' }
     }
+    if (
+      item.change_type === 'targeted_upload' ||
+      item.change_type_display === '靶向上传' ||
+      item.source_target_section
+    ) {
+      return { color: 'purple', label: '靶向上传' }
+    }
     return { color: 'blue', label: 'AI 抽取' }
   }
 
@@ -340,7 +330,7 @@ const ModificationHistory = ({ fieldPath, patientId, projectId, refreshKey = 0, 
       ) : history.length === 0 ? (
         <div style={{ textAlign: 'center', padding: 16, color: '#999', fontSize: 11 }}>暂无抽取记录</div>
       ) : (
-        <div style={{ maxHeight: 360, overflowY: 'auto' }} className="schema-form-scrollable">
+        <div className="schema-form-scrollable">
           {history.map((item, index) => {
             const displayVal = extractDisplayValue(item)
             const typeInfo = getTypeInfo(item)
@@ -1101,19 +1091,15 @@ const SourcePanel = ({
   const panelStyle = isPinned
     ? (
         contentAdaptive
-          // 患者详情 Schema 模式：右侧溯源区块随页面滚动，滚到顶部后吸附在视口顶部，始终可见
+          // 患者详情 Schema 模式：右侧溯源区块随页面滚动
+          // 不限制高度也不生成内部滚动条，整块内容跟随外部页面滚动自然展开
           ? {
               width,
               background: '#fafafa',
               borderLeft: '1px solid #f0f0f0',
               display: 'flex',
               flexDirection: 'column',
-              position: 'sticky',
-              top: 56,                 // 与 Schema 左侧树的 sticky 顶部对齐
               alignSelf: 'flex-start',
-              maxHeight: 'calc(100vh - 56px)',
-              overflowY: 'auto',
-              overflowX: 'hidden',
               zIndex: 1,
             }
           // 其他场景保持原有“占满父容器高度”的固定布局

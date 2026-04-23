@@ -366,13 +366,16 @@ router.put('/:patientId/ehr-schema-data', (req: Request, res: Response) => {
  * GET /api/v1/patients/:patientId/ehr-field-history
  *
  * 返回某个字段路径的所有候选值历史记录
- * Query: field_path (required) — 字段路径，如 "基本信息.人口学情况.身份信息.患者姓名"
+ * Query:
+ *   - field_path (required) — 字段路径，如 "基本信息.人口学情况.身份信息.患者姓名"
+ *   - project_id (optional) — 若传入，则查询该项目对应 schema 的 project_crf 实例（而非 patient_ehr）
  * 前端 ModificationHistory 组件直接消费
  */
 router.get('/:patientId/ehr-field-history', (req: Request, res: Response) => {
   try {
     const { patientId } = req.params
     const rawFieldPath = req.query.field_path as string
+    const projectIdParam = typeof req.query.project_id === 'string' ? req.query.project_id.trim() : ''
 
     if (!rawFieldPath) {
       return res.json({
@@ -419,12 +422,26 @@ router.get('/:patientId/ehr-field-history', (req: Request, res: Response) => {
     // Dedupe
     const uniquePaths = [...new Set(pathsToTry)]
 
-    // Find instance
-    const instance = db.prepare(`
-      SELECT id FROM schema_instances
-      WHERE patient_id = ? AND instance_type = 'patient_ehr'
-      ORDER BY created_at DESC LIMIT 1
-    `).get(patientId) as any
+    // Find schema instance: 病历夹默认 patient_ehr；科研项目详情传 project_id 时用 project_crf
+    let instance: { id: string } | undefined
+    if (projectIdParam) {
+      const proj = db.prepare(`SELECT schema_id FROM projects WHERE id = ?`).get(projectIdParam) as
+        | { schema_id: string }
+        | undefined
+      if (proj?.schema_id) {
+        instance = db.prepare(`
+          SELECT id FROM schema_instances
+          WHERE patient_id = ? AND schema_id = ? AND instance_type = 'project_crf'
+          ORDER BY updated_at DESC LIMIT 1
+        `).get(patientId, proj.schema_id) as { id: string } | undefined
+      }
+    } else {
+      instance = db.prepare(`
+        SELECT id FROM schema_instances
+        WHERE patient_id = ? AND instance_type = 'patient_ehr'
+        ORDER BY created_at DESC LIMIT 1
+      `).get(patientId) as { id: string } | undefined
+    }
 
     if (!instance) {
       return res.json({
@@ -451,9 +468,14 @@ router.get('/:patientId/ehr-field-history', (req: Request, res: Response) => {
         fvc.created_by,
         fvc.created_at,
         fvc.extraction_run_id,
-        d.file_name as source_document_name
+        d.file_name AS source_document_name,
+        COALESCE(
+          NULLIF(TRIM(json_extract(d.metadata, '$.target_section')), ''),
+          NULLIF(TRIM(er.target_path), '')
+        ) AS source_target_section
       FROM field_value_candidates fvc
       LEFT JOIN documents d ON d.id = fvc.source_document_id
+      LEFT JOIN extraction_runs er ON er.id = fvc.extraction_run_id
       WHERE fvc.instance_id = ? AND fvc.field_path IN (${placeholders})
       ORDER BY fvc.created_at DESC
     `).all(instance.id, ...uniquePaths) as any[]
@@ -470,17 +492,36 @@ router.get('/:patientId/ehr-field-history', (req: Request, res: Response) => {
         try { oldValue = JSON.parse(olderCandidate.value_json) } catch { oldValue = olderCandidate.value_json }
       }
 
+      // 靶向上传：文档 metadata.target_section，或物化时写入的 extraction_runs.target_path（项目/病历夹一致）
+      const targetSection = (c.source_target_section || null) as string | null
+      const createdBy = String(c.created_by || '').toLowerCase()
+      const isTargetedUpload = createdBy === 'ai' && !!targetSection
+
+      let changeType: string
+      let changeTypeDisplay: string
+      if (createdBy === 'user') {
+        changeType = 'manual_edit'
+        changeTypeDisplay = '手动修改'
+      } else if (createdBy === 'ai') {
+        changeType = isTargetedUpload ? 'targeted_upload' : 'extract'
+        changeTypeDisplay = isTargetedUpload ? '靶向上传' : 'AI 抽取'
+      } else {
+        changeType = 'initial_extract'
+        changeTypeDisplay = '系统初始化'
+      }
+
       return {
         id: c.id,
         field_path: fieldPath,
         old_value: oldValue,
         new_value: newValue,
-        change_type: c.created_by === 'ai' ? 'extract' : (c.created_by === 'user' ? 'manual_edit' : 'initial_extract'),
-        change_type_display: c.created_by === 'ai' ? 'AI抽取' : (c.created_by === 'user' ? '手动修改' : '系统初始化'),
+        change_type: changeType,
+        change_type_display: changeTypeDisplay,
         operator_type: c.created_by,
-        operator_name: c.created_by === 'ai' ? 'AI系统' : (c.created_by === 'user' ? '用户' : '系统'),
+        operator_name: createdBy === 'ai' ? (isTargetedUpload ? '靶向上传' : 'AI系统') : (createdBy === 'user' ? '用户' : '系统'),
         source_document_id: c.source_document_id,
         source_document_name: c.source_document_name,
+        source_target_section: targetSection,
         source_page: c.source_page,
         source_text: c.source_text,
         confidence: c.confidence,
@@ -679,6 +720,415 @@ router.post('/:patientId/merge-ehr', (req: Request, res: Response) => {
   } catch (err: any) {
     console.error('[POST merge-ehr]', err)
     return res.status(500).json({ success: false, code: 500, message: err.message, data: null })
+  }
+})
+
+// ============================================================
+// 候选值（Field Value Candidates）— 列表 & 固化
+// ============================================================
+
+/**
+ * 把前端传入的字段路径归一化为候选查询路径列表。
+ * 与 /ehr-field-history 的解析策略对齐：
+ *   1. 原路径（可能是点分或已带前导 /）
+ *   2. 去掉所有数字段（repeatable 行字段在候选表里可能存在父数组路径下）
+ *   3. 去掉末尾 /N/subField
+ *   4. 去掉末尾 /N
+ */
+function buildCandidateFieldPaths(rawFieldPath: string): string[] {
+  let fieldPath = rawFieldPath
+  if (!fieldPath.startsWith('/')) {
+    fieldPath = '/' + fieldPath.replace(/\./g, '/')
+  }
+  const normalizeIndexedFieldPath = (path: string) =>
+    path
+      .split('/')
+      .filter(Boolean)
+      .filter((seg) => !/^\d+$/.test(seg))
+      .join('/')
+
+  const pathsToTry: string[] = [fieldPath]
+  const normalizedIndexedPath = '/' + normalizeIndexedFieldPath(fieldPath)
+  if (normalizedIndexedPath !== fieldPath) {
+    pathsToTry.push(normalizedIndexedPath)
+  }
+  const cellMatch = fieldPath.match(/^(.+)\/\d+\/.+$/)
+  if (cellMatch) pathsToTry.push(cellMatch[1])
+  const rowMatch = fieldPath.match(/^(.+)\/\d+$/)
+  if (rowMatch) pathsToTry.push(rowMatch[1])
+  return [...new Set(pathsToTry)]
+}
+
+/**
+ * 定位某患者（可选 project_id）的 schema instance。
+ * 与 /ehr-field-history 的 instance 解析逻辑保持一致。
+ */
+function resolveSchemaInstance(
+  patientId: string,
+  projectIdParam: string
+): { id: string } | undefined {
+  if (projectIdParam) {
+    const proj = db
+      .prepare(`SELECT schema_id FROM projects WHERE id = ?`)
+      .get(projectIdParam) as { schema_id: string } | undefined
+    if (!proj?.schema_id) return undefined
+    return db
+      .prepare(
+        `SELECT id FROM schema_instances
+         WHERE patient_id = ? AND schema_id = ? AND instance_type = 'project_crf'
+         ORDER BY updated_at DESC LIMIT 1`
+      )
+      .get(patientId, proj.schema_id) as { id: string } | undefined
+  }
+  return db
+    .prepare(
+      `SELECT id FROM schema_instances
+       WHERE patient_id = ? AND instance_type = 'patient_ehr'
+       ORDER BY created_at DESC LIMIT 1`
+    )
+    .get(patientId) as { id: string } | undefined
+}
+
+/**
+ * 解析存储在 field_value_candidates.source_bbox_json 中的坐标。
+ * 兼容 Python 端多次 json.dumps 导致的双重转义，以及裸数组形式的 bbox。
+ */
+function parseSourceLocation(raw: string | null, page: number | null) {
+  if (!raw) return null
+  try {
+    let parsed: any = JSON.parse(raw)
+    if (typeof parsed === 'string') {
+      try {
+        parsed = JSON.parse(parsed)
+      } catch {
+        // 保留原字符串
+      }
+    }
+    if (Array.isArray(parsed) && parsed.length >= 4) {
+      return {
+        bbox: parsed,
+        page: page !== null ? page : 1,
+        position: { x: parsed[0], y: parsed[1] },
+      }
+    }
+    return parsed
+  } catch {
+    return null
+  }
+}
+
+/**
+ * GET /api/v1/patients/:patientId/ehr-field-candidates
+ *
+ * 返回某字段路径下的全部候选事件（不去重），以及当前选中的 candidate。
+ * Query:
+ *   - field_path (required)
+ *   - project_id (optional) — 项目 CRF 模式
+ *
+ * 响应：
+ * {
+ *   candidates: Array<{
+ *     id, value, source_document_id, source_document_name,
+ *     source_page, source_location, source_text, confidence,
+ *     created_by, created_at, occurrence_count
+ *   }>,
+ *   selected_candidate_id: string | null,
+ *   selected_value: any,
+ *   has_value_conflict: boolean,
+ *   distinct_value_count: number
+ * }
+ */
+router.get('/:patientId/ehr-field-candidates', (req: Request, res: Response) => {
+  try {
+    const { patientId } = req.params
+    const rawFieldPath = req.query.field_path as string
+    const projectIdParam =
+      typeof req.query.project_id === 'string' ? req.query.project_id.trim() : ''
+
+    if (!rawFieldPath) {
+      return res.status(400).json({
+        success: false,
+        code: 400,
+        message: '缺少 field_path',
+      })
+    }
+
+    const instance = resolveSchemaInstance(patientId, projectIdParam)
+    if (!instance) {
+      return res.json({
+        success: true,
+        code: 0,
+        data: {
+          candidates: [],
+          selected_candidate_id: null,
+          selected_value: null,
+          has_value_conflict: false,
+          distinct_value_count: 0,
+        },
+      })
+    }
+
+    const uniquePaths = buildCandidateFieldPaths(rawFieldPath)
+    const placeholders = uniquePaths.map(() => '?').join(',')
+
+    const rows = db
+      .prepare(
+        `SELECT
+           fvc.id,
+           fvc.field_path,
+           fvc.value_json,
+           fvc.value_type,
+           fvc.source_document_id,
+           fvc.source_page,
+           fvc.source_bbox_json,
+           fvc.source_text,
+           fvc.confidence,
+           fvc.created_by,
+           fvc.created_at,
+           d.file_name AS source_document_name
+         FROM field_value_candidates fvc
+         LEFT JOIN documents d ON d.id = fvc.source_document_id
+         WHERE fvc.instance_id = ? AND fvc.field_path IN (${placeholders})
+         ORDER BY fvc.created_at DESC`
+      )
+      .all(instance.id, ...uniquePaths) as any[]
+
+    // 查每个候选路径对应的 selected 记录（取 instance 级第一条匹配）
+    const selectedRow = db
+      .prepare(
+        `SELECT selected_candidate_id, selected_value_json, field_path
+         FROM field_value_selected
+         WHERE instance_id = ? AND field_path IN (${placeholders})
+         LIMIT 1`
+      )
+      .get(instance.id, ...uniquePaths) as
+      | { selected_candidate_id: string | null; selected_value_json: string | null; field_path: string }
+      | undefined
+
+    const valueCount = new Map<string, number>()
+    for (const r of rows) {
+      valueCount.set(r.value_json, (valueCount.get(r.value_json) || 0) + 1)
+    }
+
+    const candidates = rows.map((r) => {
+      let parsedValue: any
+      try {
+        parsedValue = JSON.parse(r.value_json)
+      } catch {
+        parsedValue = r.value_json
+      }
+      return {
+        id: r.id,
+        value: parsedValue,
+        source_document_id: r.source_document_id || null,
+        source_document_name: r.source_document_name || null,
+        source_page: r.source_page ?? null,
+        source_location: parseSourceLocation(r.source_bbox_json, r.source_page),
+        source_text: r.source_text || null,
+        confidence: r.confidence ?? null,
+        created_by: r.created_by || null,
+        created_at: r.created_at,
+        occurrence_count: valueCount.get(r.value_json) || 1,
+      }
+    })
+
+    let selectedValue: any = null
+    if (selectedRow?.selected_value_json) {
+      try {
+        selectedValue = JSON.parse(selectedRow.selected_value_json)
+      } catch {
+        selectedValue = selectedRow.selected_value_json
+      }
+    }
+
+    return res.json({
+      success: true,
+      code: 0,
+      data: {
+        candidates,
+        selected_candidate_id: selectedRow?.selected_candidate_id || null,
+        selected_value: selectedValue,
+        has_value_conflict: valueCount.size > 1,
+        distinct_value_count: valueCount.size,
+      },
+    })
+  } catch (err: any) {
+    console.error('[GET ehr-field-candidates]', err)
+    return res.status(500).json({
+      success: false,
+      code: 500,
+      message: err.message,
+    })
+  }
+})
+
+/**
+ * POST /api/v1/patients/:patientId/ehr-field-candidates/select
+ *
+ * 用户从候选值列表点击"采用此值"：
+ *   1. 校验候选存在且属于当前 instance
+ *   2. UPSERT field_value_selected
+ *   3. 追加一条 created_by='user' 的审计 candidate（保留溯源）
+ *
+ * Body:
+ *   - field_path (required) — 用户点击时所处的字段路径
+ *   - candidate_id (required)
+ *   - project_id (optional) — 项目 CRF 模式
+ */
+router.post('/:patientId/ehr-field-candidates/select', (req: Request, res: Response) => {
+  try {
+    const { patientId } = req.params
+    const { field_path: rawFieldPath, candidate_id: candidateId, project_id: projectIdRaw } =
+      req.body || {}
+    const projectIdParam = typeof projectIdRaw === 'string' ? projectIdRaw.trim() : ''
+
+    if (!rawFieldPath || !candidateId) {
+      return res.status(400).json({
+        success: false,
+        code: 400,
+        message: '缺少 field_path 或 candidate_id',
+      })
+    }
+
+    const instance = resolveSchemaInstance(patientId, projectIdParam)
+    if (!instance) {
+      return res.status(404).json({
+        success: false,
+        code: 404,
+        message: '未找到患者对应的 schema instance',
+      })
+    }
+
+    // 候选必须属于当前 instance，并拿到它的 value/source 用于 UPSERT 和审计
+    const candidate = db
+      .prepare(
+        `SELECT id, instance_id, field_path, value_json, value_type,
+                source_document_id, source_page, source_block_id, source_bbox_json,
+                source_text, confidence
+         FROM field_value_candidates
+         WHERE id = ? AND instance_id = ?`
+      )
+      .get(candidateId, instance.id) as
+      | {
+          id: string
+          instance_id: string
+          field_path: string
+          value_json: string
+          value_type: string | null
+          source_document_id: string | null
+          source_page: number | null
+          source_block_id: string | null
+          source_bbox_json: string | null
+          source_text: string | null
+          confidence: number | null
+        }
+      | undefined
+
+    if (!candidate) {
+      return res.status(404).json({
+        success: false,
+        code: 404,
+        message: '候选不存在或不属于该患者的 schema instance',
+      })
+    }
+
+    // 允许：field_path 与候选自身 field_path 在归一化集合里同源即可
+    const allowedPaths = new Set(buildCandidateFieldPaths(rawFieldPath))
+    if (!allowedPaths.has(candidate.field_path)) {
+      return res.status(409).json({
+        success: false,
+        code: 409,
+        message: '候选的 field_path 与请求不匹配',
+        data: {
+          candidate_field_path: candidate.field_path,
+          requested_field_path: rawFieldPath,
+        },
+      })
+    }
+
+    // 固化目标路径：优先使用前端请求的具体路径（含索引），fallback 到候选记录自身的 field_path
+    // 这样 UI 点击 /治疗情况/药物/0/名称 时，selected 记录落在该具体位置，不会污染同组其它行
+    const targetFieldPath = rawFieldPath.startsWith('/')
+      ? rawFieldPath
+      : '/' + rawFieldPath.replace(/\./g, '/')
+
+    const upsertSelected = db.prepare(`
+      INSERT INTO field_value_selected
+        (id, instance_id, field_path, selected_candidate_id, selected_value_json, selected_by)
+      VALUES (?, ?, ?, ?, ?, 'user')
+      ON CONFLICT(instance_id, COALESCE(section_instance_id, '__null__'), COALESCE(row_instance_id, '__null__'), field_path)
+      DO UPDATE SET
+        selected_candidate_id = excluded.selected_candidate_id,
+        selected_value_json   = excluded.selected_value_json,
+        selected_by           = 'user',
+        updated_at            = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+    `)
+
+    // 审计：用户采用某候选 = 手动修改事件，带上原候选的溯源信息，created_by='user'
+    const insertAuditCandidate = db.prepare(`
+      INSERT INTO field_value_candidates
+        (id, instance_id, field_path, value_json, value_type,
+         source_document_id, source_page, source_block_id, source_bbox_json,
+         source_text, confidence, created_by)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'user')
+    `)
+
+    const auditId = randomUUID()
+    const selectedId = randomUUID()
+
+    const doSelect = db.transaction(() => {
+      insertAuditCandidate.run(
+        auditId,
+        instance.id,
+        targetFieldPath,
+        candidate.value_json,
+        candidate.value_type,
+        candidate.source_document_id,
+        candidate.source_page,
+        candidate.source_block_id,
+        candidate.source_bbox_json,
+        // 标记来源为"采用候选"，便于历史记录里识别
+        `用户采用候选 ${candidate.id}`,
+        candidate.confidence
+      )
+      // 绑定到新生成的审计 candidate，保留"当前值 = 用户手动选择"的语义
+      // 这样修改历史时间轴里会多一条 manual_edit 条目，且 candidates 仍可复用旧 id
+      upsertSelected.run(
+        selectedId,
+        instance.id,
+        targetFieldPath,
+        auditId,
+        candidate.value_json
+      )
+    })
+
+    doSelect()
+
+    let selectedValue: any = null
+    try {
+      selectedValue = JSON.parse(candidate.value_json)
+    } catch {
+      selectedValue = candidate.value_json
+    }
+
+    return res.json({
+      success: true,
+      code: 0,
+      message: '已采用此值',
+      data: {
+        field_path: targetFieldPath,
+        selected_candidate_id: auditId,
+        source_candidate_id: candidate.id,
+        selected_value: selectedValue,
+      },
+    })
+  } catch (err: any) {
+    console.error('[POST ehr-field-candidates/select]', err)
+    return res.status(500).json({
+      success: false,
+      code: 500,
+      message: err.message,
+    })
   }
 })
 

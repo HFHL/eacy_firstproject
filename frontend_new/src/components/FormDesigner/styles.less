@@ -1,0 +1,751 @@
+/**
+ * FormDesigner 样式文件
+ * 注意：不包含顶部工具栏样式，由父组件提供
+ */
+
+.form-designer {
+  height: 100%;
+  min-height: 500px; // 确保最小高度
+  display: flex;
+  flex-direction: column;
+  background: #fff;
+  border-radius: 8px;
+  border: 1px solid #e8e8e8;
+  overflow: hidden;
+
+  .main-content {
+    flex: 1;
+    overflow: hidden;
+    display: flex;
+    flex-direction: column;
+    min-height: 0; // 重要：允许 flex 子元素收缩
+
+    // 修复 Ant Design Tabs 高度继承问题
+    .ant-tabs {
+      height: 100%;
+      display: flex;
+      flex-direction: column;
+      // 仅保留布局属性，视觉样式由各面板私有类负责
+      .ant-tabs-nav {
+        margin-bottom: 0;
+      }
+
+      .ant-tabs-content-holder {
+        flex: 1;
+        min-height: 0; // 关键：允许内容区收缩
+        overflow: hidden;
+      }
+
+      .ant-tabs-content {
+        height: 100%;
+      }
+
+      .ant-tabs-tabpane {
+        height: 100%;
+        overflow: hidden;
+      }
+    }
+  }
+
+  .design-view {
+    height: 100%;
+    overflow: hidden;
+
+    .placeholder-content {
+      width: 100%;
+      padding: 24px;
+      text-align: center;
+      background: #f5f5f5;
+      border-radius: 4px;
+    }
+  }
+
+  .json-preview {
+    height: 100%;
+    overflow: auto;
+    padding: 16px;
+    background: #f9f9f9;
+    border-radius: 4px;
+    margin: 8px;
+
+    pre {
+      margin: 0;
+      white-space: pre-wrap;
+      word-wrap: break-word;
+      font-size: 12px;
+      line-height: 1.5;
+    }
+  }
+}
+
+.form-designer-borderless {
+  border: none;
+  border-radius: 0;
+}
+
+/* 左侧标签页 */
+.form-designer .left-panel-tabs {
+  height: 100%;
+  display: flex;
+  flex-direction: column;
+  background: #fff;
+
+  .ant-tabs-nav {
+    margin-bottom: 0;
+    padding: 0 12px;
+    background: #fff;
+    border-bottom: 1px solid #e8e8e8;
+    min-height: 38px;
+    height: 38px;
+
+    .ant-tabs-nav-wrap {
+      height: 100%;
+      display: flex;
+      align-items: center;
+    }
+  }
+
+  .ant-tabs-content-holder {
+    flex: 1;
+    min-height: 0;
+    overflow: hidden;
+  }
+
+  .ant-tabs-content {
+    height: 100%;
+  }
+
+  .ant-tabs-tabpane {
+    height: 100%;
+    min-height: 0;
+    overflow: hidden;
+    padding: 8px;
+  }
+
+  .ant-tabs-tabpane-active {
+    display: flex;
+    flex-direction: column;
+  }
+}
+
+/* 左侧组件库 */
+.component-library {
+  height: 100%;
+  display: flex;
+  flex-direction: column;
+
+  &__search {
+    margin-bottom: 12px;
+    flex-shrink: 0;
+  }
+
+  &__scroll {
+    flex: 1;
+    min-height: 0;
+    overflow-y: auto;
+    overflow-x: hidden;
+    padding-right: 4px;
+  }
+
+  &__empty {
+    flex: 1;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    background: #fff;
+    border-radius: 8px;
+  }
+}
+
+.component-library-section {
+  margin-bottom: 16px;
+  container-type: inline-size;
+
+  &__title {
+    margin-bottom: 8px;
+    font-size: 12px;
+    line-height: 18px;
+    color: #8c8c8c;
+  }
+}
+
+.component-library-grid {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  gap: 8px;
+}
+
+@container (min-width: 230px) {
+  .component-library-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+}
+
+.component-library-item {
+  min-width: 0;
+}
+
+.component-card {
+  height: 100%;
+  min-height: 52px;
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  padding: 10px 12px;
+  background: #fff;
+  border: 1px solid #e8e8e8;
+  border-radius: 8px;
+  transition: border-color 0.2s ease, box-shadow 0.2s ease, transform 0.2s ease, opacity 0.2s ease;
+  position: relative;
+  user-select: none;
+  &:active {
+    cursor: grabbing;
+  }
+
+  &.is-draggable {
+    cursor: grab;
+
+    &:hover {
+      border-color: #1890ff;
+      box-shadow: 0 4px 12px rgba(24, 144, 255, 0.14);
+      transform: translateY(-1px);
+    }
+  }
+
+  &.is-disabled {
+    cursor: not-allowed;
+    opacity: 0.68;
+  }
+  &.coming-soon:hover {
+    border-color: #e8e8e8 !important;
+    box-shadow: none !important;
+    transform: none !important;
+  }
+
+  &__handle,
+  &__icon {
+    flex-shrink: 0;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    line-height: 1;
+  }
+
+  &__handle {
+    margin-top: 2px;
+    color: #bfbfbf;
+    font-size: 12px;
+  }
+
+  &__icon {
+    margin-top: 1px;
+    width: 18px;
+    min-width: 18px;
+    color: #5f6b7a;
+    font-size: 14px;
+  }
+
+  &__label {
+    flex: 1;
+    min-width: 0;
+    font-size: 13px;
+    line-height: 1.35;
+    color: #333;
+    display: -webkit-box;
+    -webkit-box-orient: vertical;
+    -webkit-line-clamp: 2;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    word-break: break-word;
+  }
+
+  &__status {
+    position: absolute;
+    top: 8px;
+    right: 8px;
+    font-size: 10px;
+    line-height: 16px;
+    padding-inline: 4px;
+    margin: 0;
+    pointer-events: none;
+    z-index: 1;
+  }
+}
+
+/* 右侧标签页 */
+.form-designer .right-panel-tabs {
+  height: 100%;
+  display: flex;
+  flex-direction: column;
+  background: #fff;
+
+  .ant-tabs-nav {
+    margin-bottom: 0;
+    padding: 0 12px;
+    background: #fff;
+    border-bottom: 1px solid #e8e8e8;
+    min-height: 38px;
+    height: 38px;
+
+    .ant-tabs-nav-wrap {
+      height: 100%;
+      display: flex;
+      align-items: center;
+    }
+  }
+
+  .ant-tabs-content-holder {
+    flex: 1;
+    min-height: 0;
+    overflow: hidden;
+  }
+
+  .ant-tabs-content {
+    height: 100%;
+  }
+
+  .ant-tabs-tabpane {
+    height: 100%;
+    min-height: 0;
+    overflow: hidden;
+    padding: 8px;
+  }
+
+  .ant-tabs-tabpane-active {
+    display: flex;
+    flex-direction: column;
+  }
+}
+
+/* 可调整三栏布局 */
+.resizable-panels {
+  display: flex;
+  height: 100%;
+  position: relative;
+  background: #fff;
+
+  // 左侧面板容器
+  .left-panel-wrapper {
+    display: flex;
+    flex-direction: column;
+    height: 100%;
+    background: #fff;
+  }
+
+  // 中间面板容器
+  .center-panel-wrapper {
+    display: flex;
+    flex-direction: column;
+    height: 100%;
+    background: #fff;
+  }
+
+  // 右侧面板容器
+  .right-panel-wrapper {
+    display: flex;
+    flex-direction: column;
+    height: 100%;
+    background: #fff;
+  }
+
+  .resize-handle {
+    position: relative;
+    z-index: 10;
+    background: #f0f0f0;
+    transition: background 0.2s;
+
+    &:hover {
+      background: #e0e0e0;
+      
+      .resize-handle-indicator {
+        background: #1677ff;
+      }
+    }
+
+    .resize-handle-indicator {
+      width: 4px;
+      height: 40px;
+      background: #c0c0c0;
+      border-radius: 2px;
+      transition: background 0.2s;
+    }
+  }
+}
+
+/* 三栏布局（旧版，保留备用） */
+.three-panel-layout {
+  display: flex;
+  height: 100%;
+  gap: 8px;
+
+  .left-panel {
+    width: 240px;
+    min-width: 200px;
+    max-width: 320px;
+    overflow: hidden;
+    display: flex;
+    flex-direction: column;
+
+    .left-panels {
+      flex: 1;
+      overflow: auto;
+    }
+  }
+
+  .center-panel {
+    flex: 1;
+    min-width: 600px;
+    overflow: auto;
+  }
+
+  .right-panel {
+    width: 360px;
+    min-width: 300px;
+    max-width: 450px;
+    overflow: auto;
+  }
+}
+
+/* 文件夹树样式 */
+.folder-tree {
+  height: 100%;
+  display: flex;
+  flex-direction: column;
+
+  .design-tree {
+    flex: 1;
+    overflow-y: auto;
+    overflow-x: hidden; // 隐藏横向滚动条
+    
+    // 树整体样式 - 紧凑布局
+    .ant-tree {
+      overflow: hidden;
+      
+      // 减少树节点左侧padding
+      .ant-tree-treenode {
+        padding-left: 4px !important;
+        padding-right: 4px;
+      }
+    }
+
+    // 树节点列表
+    .ant-tree-list {
+      overflow: hidden;
+    }
+
+    // 缩进单元宽度减小
+    .ant-tree-indent-unit {
+      width: 16px !important; // 默认是24px，减小到16px
+    }
+    
+    // 切换图标紧凑
+    .ant-tree-switcher {
+      flex-shrink: 0;
+      width: 20px !important; // 默认是24px
+      margin-right: 0;
+    }
+
+    // 节点图标紧凑
+    .ant-tree-iconEle {
+      flex-shrink: 0;
+      width: 18px !important;
+      margin-right: 4px !important;
+    }
+    
+    .ant-tree-node-content-wrapper {
+      display: flex;
+      align-items: center;
+      flex: 1;
+      min-width: 0;
+      padding: 0 4px 0 0 !important; // 减少内部padding
+      overflow: hidden;
+      
+      &:hover {
+        background: #f5f5f5;
+      }
+    }
+
+    .ant-tree-node-selected {
+      background: #e6f7ff !important;
+    }
+
+    // 确保树节点标题填满宽度并支持文本省略
+    .ant-tree-title {
+      flex: 1;
+      min-width: 0;
+      overflow: hidden;
+    }
+
+    // 文件夹标题样式
+    .folder-title-wrapper {
+      min-height: 24px;
+      min-width: 0;
+      overflow: hidden;
+      
+      .ant-btn-link {
+        font-size: 12px;
+        padding: 0 4px;
+        height: auto;
+      }
+    }
+
+    // 表单标题样式
+    .group-title-wrapper {
+      min-height: 24px;
+      min-width: 0;
+      overflow: hidden;
+    }
+  }
+}
+
+/* 设计画布样式 */
+.design-canvas {
+  height: 100%;
+  overflow: auto;
+  padding: 12px;
+  background: #fff;
+
+  .group-list {
+    display: flex;
+    flex-direction: column;
+    gap: 0;
+    min-height: 100%;
+  }
+
+  // 空状态样式，确保填充整个高度
+  .ant-empty {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    min-height: 300px;
+  }
+}
+
+/* 中间栏：标题固定，只有内容区滚动 */
+.design-canvas.design-canvas-group-mode {
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  padding: 0;
+
+  .group-list {
+    flex: 1;
+    min-height: 0;
+    overflow: hidden;
+  }
+
+  .group-card {
+    height: 100%;
+    min-height: 0;
+    border-radius: 0;
+  }
+}
+
+/* 表单配置面板样式 */
+.form-config-panel {
+  height: 100%;
+  overflow: auto;
+}
+
+/* 字段配置面板样式 */
+.field-config-panel {
+  height: 100%;
+  overflow: auto;
+}
+
+/* 字段卡片 - 旧版样式（保留兼容） */
+.field-card {
+  background: #fff;
+  border: 1px solid #d9d9d9;
+  border-radius: 4px;
+  padding: 12px;
+  margin-bottom: 8px;
+  cursor: pointer;
+  transition: all 0.2s;
+
+  &:hover {
+    border-color: #1677ff;
+    box-shadow: 0 2px 8px rgba(0, 0, 0, 0.08);
+  }
+
+  &.selected {
+    border-color: #1677ff;
+    background: #e6f7ff;
+  }
+}
+
+/* 字段卡片预览样式 - 表单填写预览形式 */
+.field-card-preview {
+  background: #fff;
+  cursor: pointer;
+  transition: all 0.2s ease;
+  border-radius: 8px;
+  border: 1px solid #f0f0f0;
+  position: relative;
+
+  &:hover,
+  &.hovered {
+    background: #fff;
+    box-shadow: 0 4px 12px rgba(0, 0, 0, 0.1);
+    border-color: #e0e0e0;
+    
+    // 悬停时显示操作按钮动画
+    .field-actions {
+      opacity: 1;
+      transform: translateX(0);
+    }
+  }
+
+  &.selected {
+    background: #f0f7ff;
+    border: 2px solid #1890ff;
+    box-shadow: 0 2px 8px rgba(24, 144, 255, 0.15);
+  }
+
+  // 禁用输入组件的鼠标事件，只用于展示
+  .ant-input,
+  .ant-input-number,
+  .ant-picker,
+  .ant-select,
+  .ant-slider {
+    pointer-events: none;
+  }
+
+  // 选项区域可交互
+  .editable-option-item {
+    .ant-radio-wrapper,
+    .ant-checkbox-wrapper {
+      pointer-events: none;
+    }
+  }
+
+  // 单选/多选选项样式优化
+  .ant-radio-group,
+  .ant-checkbox-group {
+    .ant-radio-wrapper,
+    .ant-checkbox-wrapper {
+      margin-bottom: 4px;
+      color: #333;
+    }
+  }
+
+  // 矩阵表格样式优化
+  .ant-table {
+    .ant-table-thead > tr > th {
+      background: #fafafa;
+      padding: 8px 12px;
+      font-weight: normal;
+    }
+    .ant-table-tbody > tr > td {
+      padding: 8px 12px;
+    }
+  }
+
+  // 操作按钮默认隐藏
+  .field-actions {
+    opacity: 0;
+    transform: translateX(10px);
+    transition: all 0.2s ease;
+  }
+}
+
+/* 可编辑选项样式 */
+.editable-option-item {
+  transition: background 0.2s ease;
+  
+  &:hover {
+    background: #f5f5f5;
+    
+    // 显示操作按钮
+    .ant-btn {
+      opacity: 1;
+    }
+  }
+  
+  .ant-btn {
+    opacity: 0;
+    transition: opacity 0.2s ease;
+  }
+}
+
+/* 字段组卡片 */
+.group-card {
+  background: #fff;
+  margin-bottom: 0;
+  border-radius: 8px;
+  overflow: hidden;
+  border: none;
+  box-shadow: none;
+  height: 100%;
+  display: flex;
+  flex-direction: column;
+
+  &.selected {
+    border: none;
+    box-shadow: none;
+  }
+
+  .group-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    height: 38px;
+    min-height: 38px;
+    padding: 0 12px;
+    border-bottom: 1px solid #f0f0f0;
+    background: #fff;
+    position: sticky;
+    top: 0;
+    z-index: 5;
+    
+    // 表单标题悬停可编辑
+    .group-title {
+      font-size: 14px;
+      font-weight: 500;
+      color: #333;
+      margin: 0;
+      line-height: 20px;
+      padding: 4px 8px;
+      display: inline-flex;
+      align-items: center;
+      min-height: 28px;
+      
+      &:hover {
+        border-color: #d9d9d9 !important;
+        background: #fafafa !important;
+      }
+    }
+  }
+
+  .group-body {
+    flex: 1;
+    min-height: 0;
+    overflow-y: auto;
+    overflow-x: hidden;
+    scrollbar-gutter: stable;
+  }
+
+  .group-fields {
+    padding: 12px;
+  }
+}
+
+/* 拖拽相关样式 */
+.dragging {
+  opacity: 0.5;
+}
+
+.drag-over {
+  border: 2px dashed #1677ff;
+  background: #e6f7ff;
+}
+
+/* 设计器滚动辅助样式 */
+.form-designer {
+  .form-config-panel,
+  .field-config-panel {
+    padding: 0 4px;
+    box-sizing: border-box;
+  }
+}
