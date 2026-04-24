@@ -21,7 +21,7 @@ import { useEhrLayout } from './hooks/useEhrLayout'
 import { useEhrFieldGroups } from './hooks/useEhrFieldGroups'
 import { useEhrFieldEdit } from './hooks/useEhrFieldEdit'
 // 导入API
-import { extractEhrData, getDocumentTempUrl } from '@/api/document'
+import { extractEhrData, getDocumentPdfStreamUrl, getDocumentTempUrl } from '@/api/document'
 import { getEhrFieldHistory } from '@/api/patient'
 import { appThemeToken } from '@/styles/themeTokens'
 
@@ -251,7 +251,10 @@ const EhrTab = ({
             const urlRes = await getDocumentTempUrl(traceableHistory.source_document_id)
             console.log('文档URL响应:', urlRes)
             if (urlRes.success && urlRes.data?.temp_url) {
-              setDocumentImageUrl(urlRes.data.temp_url)
+              const fileType = String(urlRes.data.file_type || '').toLowerCase()
+              setDocumentImageUrl(fileType === 'pdf'
+                ? getDocumentPdfStreamUrl(traceableHistory.source_document_id)
+                : urlRes.data.temp_url)
             }
           } catch (urlError) {
             console.error('获取文档URL失败:', urlError)
@@ -267,7 +270,10 @@ const EhrTab = ({
             try {
               const urlRes = await getDocumentTempUrl(matched.id)
               if (urlRes.success && urlRes.data?.temp_url) {
-                setDocumentImageUrl(urlRes.data.temp_url)
+                const fileType = String(urlRes.data.file_type || '').toLowerCase()
+                setDocumentImageUrl(fileType === 'pdf'
+                  ? getDocumentPdfStreamUrl(matched.id)
+                  : urlRes.data.temp_url)
               }
             } catch (urlError) {
               console.error('获取兜底文档URL失败:', urlError)

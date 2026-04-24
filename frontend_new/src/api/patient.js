@@ -369,13 +369,14 @@ export const selectEhrFieldCandidateV3 = (
   patientId,
   fieldPath,
   candidateId,
-  _selectedValue,
+  selectedValue,
   _rowUid = null,
   projectId = null
 ) => {
   return request.post(`/patients/${patientId}/ehr-field-candidates/select`, {
     field_path: fieldPath,
     candidate_id: candidateId,
+    ...(selectedValue !== undefined ? { selected_value: selectedValue } : {}),
     ...(projectId ? { project_id: projectId } : {}),
   })
 }
@@ -481,4 +482,3 @@ export default {
   generateAiSummary,
   getAiSummary
 }
-

@@ -285,7 +285,7 @@ const ProjectCreateWizardModal = ({ open, onCancel, onSuccess }) => {
         expected_patient_count: values.expected_patient_count ? Number(values.expected_patient_count) : null,
         start_date: values.project_period?.[0] ? dayjs(values.project_period[0]).format('YYYY-MM-DD') : null,
         end_date: values.project_period?.[1] ? dayjs(values.project_period[1]).format('YYYY-MM-DD') : null,
-        crf_template_id: null,
+        crf_template_id: selectedTemplateId || null,
         patient_criteria: {},
       }
       const response = await createProject(payload)

@@ -2442,7 +2442,7 @@ const ProjectDatasetView = () => {
             <div>
               <div>任务ID: <Text code>{extractionProgress?.task_id || extractionTaskId || '-'}</Text></div>
               <div style={{ marginTop: 4 }}>
-                你也可以在浏览器 Network 里查看接口：<Text code>/projects/{projectId}/crf/extraction/progress/&lt;task_id&gt;</Text>
+                你也可以在浏览器 Network 里查看接口：<Text code>/projects/{projectId}/crf/extraction/progress?task_id=&lt;task_id&gt;</Text>
               </div>
             </div>
           }

@@ -343,6 +343,7 @@ router.post('/:patientId/ehr-folder/update', async (req: Request, res: Response)
       LEFT JOIN ehr_extraction_jobs e
         ON e.document_id = d.id
        AND e.job_type = 'extract'
+       AND e.status != 'cancelled'
       WHERE d.patient_id = ?
         AND d.status != 'deleted'
       GROUP BY
@@ -358,8 +359,18 @@ router.post('/:patientId/ehr-folder/update', async (req: Request, res: Response)
       ORDER BY d.created_at DESC
     `).all(patientId) as any[]
 
+    // 未抽取：extract_result_json 为空（未成功抽过）且没有活跃任务（排除 cancelled）
     const unextractedDocs = rows
-      .filter((row) => !row.extract_result_json && Number(row.extract_job_count || 0) === 0)
+      .filter((row) => {
+        // 已有抽取结果，不重复提交
+        if (row.extract_result_json) return false
+        // 有活跃（非 cancelled）抽取任务，跳过
+        if (Number(row.extract_job_count || 0) > 0) return false
+        // extract_status 为 completed/succeeded 表示已成功抽过（兜底判断）
+        const es = (row.extract_status || '').toLowerCase()
+        if (es === 'completed' || es === 'succeeded') return false
+        return true
+      })
       .map((row) => {
         const metadata = parseJsonObject(row.metadata)
         const metadataResult = metadata.result && typeof metadata.result === 'object' ? metadata.result : metadata

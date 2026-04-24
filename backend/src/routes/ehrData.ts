@@ -16,6 +16,14 @@ function parseStoredValue(raw: string) {
   }
 }
 
+function inferValueType(value: any): string {
+  if (Array.isArray(value)) return 'array'
+  if (value === null) return 'string'
+  if (typeof value === 'number') return 'number'
+  if (typeof value === 'object') return 'object'
+  return 'string'
+}
+
 function ensureObjectPath(target: any, parts: string[]) {
   let current = target
   for (const part of parts) {
@@ -31,6 +39,88 @@ function setObjectValue(target: any, parts: string[], value: any) {
   if (parts.length === 0) return
   const parent = ensureObjectPath(target, parts.slice(0, -1))
   parent[parts[parts.length - 1]] = value
+}
+
+function normalizeRequestFieldPath(rawFieldPath: string): string {
+  let fieldPath = String(rawFieldPath || '').trim()
+  if (!fieldPath) return '/'
+  if (!fieldPath.startsWith('/')) {
+    fieldPath = '/' + fieldPath.replace(/\./g, '/')
+  }
+  return fieldPath.replace(/\/+/g, '/')
+}
+
+function normalizeIndexedFieldPath(path: string): string {
+  return '/' + String(path || '')
+    .split('/')
+    .filter(Boolean)
+    .filter((seg) => !/^\d+$/.test(seg))
+    .join('/')
+}
+
+/**
+ * 把前端传入的字段路径归一化为候选/历史查询路径列表。
+ * 与物化层 _normalize_field_path 对齐，并兼容 repeatable 行/单元格点击路径。
+ */
+function buildCandidateFieldPaths(rawFieldPath: string): string[] {
+  const fieldPath = normalizeRequestFieldPath(rawFieldPath)
+  const pathsToTry: string[] = [fieldPath]
+  const normalizedIndexedPath = normalizeIndexedFieldPath(fieldPath)
+  if (normalizedIndexedPath !== fieldPath) {
+    pathsToTry.push(normalizedIndexedPath)
+  }
+  const cellMatch = fieldPath.match(/^(.+)\/\d+\/.+$/)
+  if (cellMatch) pathsToTry.push(cellMatch[1])
+  const rowMatch = fieldPath.match(/^(.+)\/\d+$/)
+  if (rowMatch) pathsToTry.push(rowMatch[1])
+  return [...new Set(pathsToTry)]
+}
+
+function buildSelectableCandidateFieldPaths(rawFieldPath: string): string[] {
+  const fieldPath = normalizeRequestFieldPath(rawFieldPath)
+  const pathsToTry: string[] = [fieldPath]
+  const normalizedIndexedPath = normalizeIndexedFieldPath(fieldPath)
+  if (normalizedIndexedPath !== fieldPath) {
+    pathsToTry.push(normalizedIndexedPath)
+  }
+  return [...new Set(pathsToTry)]
+}
+
+function buildFieldPathSuffixes(paths: string[]): string[] {
+  const suffixes: string[] = []
+  for (const path of paths) {
+    const parts = String(path || '').split('/').filter(Boolean)
+    for (let start = 1; start < parts.length - 1; start += 1) {
+      suffixes.push('/' + parts.slice(start).join('/'))
+    }
+  }
+  return [...new Set(suffixes)]
+}
+
+function resolveSelectedPosition(instanceId: string, rawFieldPath: string) {
+  const uniquePaths = buildCandidateFieldPaths(rawFieldPath)
+  const placeholders = uniquePaths.map(() => '?').join(',')
+  if (!placeholders) {
+    return { sectionInstanceId: null, rowInstanceId: null }
+  }
+
+  const existing = db.prepare(`
+    SELECT section_instance_id, row_instance_id
+    FROM field_value_selected
+    WHERE instance_id = ? AND field_path IN (${placeholders})
+    ORDER BY
+      CASE WHEN section_instance_id IS NOT NULL OR row_instance_id IS NOT NULL THEN 0 ELSE 1 END,
+      updated_at DESC,
+      selected_at DESC
+    LIMIT 1
+  `).get(instanceId, ...uniquePaths) as
+    | { section_instance_id: string | null; row_instance_id: string | null }
+    | undefined
+
+  return {
+    sectionInstanceId: existing?.section_instance_id || null,
+    rowInstanceId: existing?.row_instance_id || null,
+  }
 }
 
 /**
@@ -103,7 +193,7 @@ router.get('/:patientId/ehr-schema-data', (req: Request, res: Response) => {
     }
 
     // 3. 读取所有 field_value_selected，组装为嵌套 JSON
-    const selectedRows = db.prepare(`
+    const rawSelectedRows = db.prepare(`
       SELECT
         fvs.field_path,
         fvs.selected_value_json,
@@ -123,8 +213,19 @@ router.get('/:patientId/ehr-schema-data', (req: Request, res: Response) => {
         COALESCE(si.repeat_index, 0),
         COALESCE(ri.group_path, ''),
         COALESCE(ri.repeat_index, 0),
-        fvs.field_path
+        fvs.field_path,
+        fvs.updated_at ASC,
+        fvs.selected_at ASC
     `).all(instance.instance_id) as any[]
+
+    const selectedByPath = new Map<string, any>()
+    for (const row of rawSelectedRows) {
+      const existing = selectedByPath.get(row.field_path)
+      if (!existing || String(row.updated_at || '') >= String(existing.updated_at || '')) {
+        selectedByPath.set(row.field_path, row)
+      }
+    }
+    const selectedRows = Array.from(selectedByPath.values())
 
     const draftData: any = {}
 
@@ -274,7 +375,7 @@ router.put('/:patientId/ehr-schema-data', (req: Request, res: Response) => {
     function flatten(obj: any, parts: string[] = []) {
       if (obj === null || obj === undefined) return
       if (Array.isArray(obj)) {
-        flatFields.push({ path: '/' + parts.join('/'), value: JSON.stringify(obj) })
+        obj.forEach((item, index) => flatten(item, [...parts, String(index)]))
         return
       }
       if (typeof obj === 'object') {
@@ -385,42 +486,9 @@ router.get('/:patientId/ehr-field-history', (req: Request, res: Response) => {
       })
     }
 
-    // 前端传点分隔，数据库存斜杠分隔，两者都支持
-    let fieldPath = rawFieldPath
-    if (!fieldPath.startsWith('/')) {
-      fieldPath = '/' + fieldPath.replace(/\./g, '/')
-    }
-
-    const normalizeIndexedFieldPath = (path: string) =>
-      path
-        .split('/')
-        .filter(Boolean)
-        .filter((seg) => !/^\d+$/.test(seg))
-        .join('/')
-
-    // Build list of candidate paths to query:
-    // 1. Exact path (for scalar fields)
-    // 2. Strip trailing /N/subField (for table cell clicks → query parent array)
-    // 3. Strip trailing /N (for table row clicks → query parent array)
-    // 4. Remove all numeric path segments (for repeatable section row fields stored without index)
-    // This handles clicks on table rows/cells whose candidates are stored at the array level.
-    const pathsToTry: string[] = [fieldPath]
-    const normalizedIndexedPath = '/' + normalizeIndexedFieldPath(fieldPath)
-    if (normalizedIndexedPath !== fieldPath) {
-      pathsToTry.push(normalizedIndexedPath)
-    }
-    // Strip /N/subField: e.g. /foo/bar/0/name → /foo/bar
-    const cellMatch = fieldPath.match(/^(.+)\/\d+\/.+$/)
-    if (cellMatch) {
-      pathsToTry.push(cellMatch[1])
-    }
-    // Strip /N: e.g. /foo/bar/0 → /foo/bar
-    const rowMatch = fieldPath.match(/^(.+)\/\d+$/)
-    if (rowMatch) {
-      pathsToTry.push(rowMatch[1])
-    }
-    // Dedupe
-    const uniquePaths = [...new Set(pathsToTry)]
+    const fieldPath = normalizeRequestFieldPath(rawFieldPath)
+    const uniquePaths = buildSelectableCandidateFieldPaths(rawFieldPath)
+    const suffixPaths = buildFieldPathSuffixes(uniquePaths)
 
     // Find schema instance: 病历夹默认 patient_ehr；科研项目详情传 project_id 时用 project_crf
     let instance: { id: string } | undefined
@@ -451,8 +519,12 @@ router.get('/:patientId/ehr-field-history', (req: Request, res: Response) => {
       })
     }
 
-    // Query all candidates for this field path (try multiple path variants)
+    // Query all candidates for this field path (try multiple path variants).
+    // Exact/normalized paths are preferred; suffix fallback covers project template paths
+    // whose group prefix differs from the extraction/materialized field_path.
     const placeholders = uniquePaths.map(() => '?').join(',')
+    const suffixClauses = suffixPaths.map(() => `fvc.field_path LIKE ?`).join(' OR ')
+    const suffixParams = suffixPaths.map((suffix) => `%${suffix}`)
     const candidates = db.prepare(`
       SELECT
         fvc.id,
@@ -476,9 +548,15 @@ router.get('/:patientId/ehr-field-history', (req: Request, res: Response) => {
       FROM field_value_candidates fvc
       LEFT JOIN documents d ON d.id = fvc.source_document_id
       LEFT JOIN extraction_runs er ON er.id = fvc.extraction_run_id
-      WHERE fvc.instance_id = ? AND fvc.field_path IN (${placeholders})
-      ORDER BY fvc.created_at DESC
-    `).all(instance.id, ...uniquePaths) as any[]
+      WHERE fvc.instance_id = ?
+        AND (
+          fvc.field_path IN (${placeholders})
+          ${suffixClauses ? `OR ${suffixClauses}` : ''}
+        )
+      ORDER BY
+        CASE WHEN fvc.field_path IN (${placeholders}) THEN 0 ELSE 1 END,
+        fvc.created_at DESC
+    `).all(instance.id, ...uniquePaths, ...suffixParams, ...uniquePaths) as any[]
 
     // Transform into the format the ModificationHistory component expects
     const history = candidates.map((c, idx) => {
@@ -513,6 +591,7 @@ router.get('/:patientId/ehr-field-history', (req: Request, res: Response) => {
       return {
         id: c.id,
         field_path: fieldPath,
+        matched_field_path: c.field_path,
         old_value: oldValue,
         new_value: newValue,
         change_type: changeType,
@@ -728,38 +807,6 @@ router.post('/:patientId/merge-ehr', (req: Request, res: Response) => {
 // ============================================================
 
 /**
- * 把前端传入的字段路径归一化为候选查询路径列表。
- * 与 /ehr-field-history 的解析策略对齐：
- *   1. 原路径（可能是点分或已带前导 /）
- *   2. 去掉所有数字段（repeatable 行字段在候选表里可能存在父数组路径下）
- *   3. 去掉末尾 /N/subField
- *   4. 去掉末尾 /N
- */
-function buildCandidateFieldPaths(rawFieldPath: string): string[] {
-  let fieldPath = rawFieldPath
-  if (!fieldPath.startsWith('/')) {
-    fieldPath = '/' + fieldPath.replace(/\./g, '/')
-  }
-  const normalizeIndexedFieldPath = (path: string) =>
-    path
-      .split('/')
-      .filter(Boolean)
-      .filter((seg) => !/^\d+$/.test(seg))
-      .join('/')
-
-  const pathsToTry: string[] = [fieldPath]
-  const normalizedIndexedPath = '/' + normalizeIndexedFieldPath(fieldPath)
-  if (normalizedIndexedPath !== fieldPath) {
-    pathsToTry.push(normalizedIndexedPath)
-  }
-  const cellMatch = fieldPath.match(/^(.+)\/\d+\/.+$/)
-  if (cellMatch) pathsToTry.push(cellMatch[1])
-  const rowMatch = fieldPath.match(/^(.+)\/\d+$/)
-  if (rowMatch) pathsToTry.push(rowMatch[1])
-  return [...new Set(pathsToTry)]
-}
-
-/**
  * 定位某患者（可选 project_id）的 schema instance。
  * 与 /ehr-field-history 的 instance 解析逻辑保持一致。
  */
@@ -792,6 +839,14 @@ function resolveSchemaInstance(
 /**
  * 解析存储在 field_value_candidates.source_bbox_json 中的坐标。
  * 兼容 Python 端多次 json.dumps 导致的双重转义，以及裸数组形式的 bbox。
+ *
+ * 新版格式（含原图尺寸）：
+ *   {"bbox":[x1,y1,x2,y2], "position":[x1,y1,...], "page_width":4344, "page_height":5792}
+ * 旧版格式（裸数组）：
+ *   [x1,y1,x2,y2]
+ *
+ * 新版格式会额外返回 page_width / page_height，
+ * 供前端将 TextIn 页面像素坐标映射到 PDF 页面像素空间。
  */
 function parseSourceLocation(raw: string | null, page: number | null) {
   if (!raw) return null
@@ -805,10 +860,23 @@ function parseSourceLocation(raw: string | null, page: number | null) {
       }
     }
     if (Array.isArray(parsed) && parsed.length >= 4) {
+      // 旧版格式：裸数组
       return {
         bbox: parsed,
         page: page !== null ? page : 1,
         position: { x: parsed[0], y: parsed[1] },
+      }
+    }
+    if (typeof parsed === 'object' && parsed !== null && Array.isArray(parsed.bbox) && parsed.bbox.length >= 4) {
+      // 新版格式：{bbox, page_width, page_height}
+      return {
+        bbox: parsed.bbox,
+        page: page !== null ? page : 1,
+        position: { x: parsed.bbox[0], y: parsed.bbox[1] },
+        page_width: parsed.page_width || null,
+        page_height: parsed.page_height || null,
+        polygon: Array.isArray(parsed.position) ? parsed.position : null,
+        page_angle: parsed.page_angle ?? null,
       }
     }
     return parsed
@@ -840,7 +908,7 @@ function parseSourceLocation(raw: string | null, page: number | null) {
  */
 router.get('/:patientId/ehr-field-candidates', (req: Request, res: Response) => {
   try {
-    const { patientId } = req.params
+    const patientId = String(req.params.patientId || '')
     const rawFieldPath = req.query.field_path as string
     const projectIdParam =
       typeof req.query.project_id === 'string' ? req.query.project_id.trim() : ''
@@ -899,16 +967,32 @@ router.get('/:patientId/ehr-field-candidates', (req: Request, res: Response) => 
         `SELECT selected_candidate_id, selected_value_json, field_path
          FROM field_value_selected
          WHERE instance_id = ? AND field_path IN (${placeholders})
+         ORDER BY updated_at DESC, selected_at DESC
          LIMIT 1`
       )
       .get(instance.id, ...uniquePaths) as
       | { selected_candidate_id: string | null; selected_value_json: string | null; field_path: string }
       | undefined
 
-    const valueCount = new Map<string, number>()
+    // 按 source_document_id 去重：同一文档的多条候选只保留最新一条（避免同文档重复计数）
+    // 冲突定义：存在 ≥2 个不同的 source_document_id（非 null）都命中了该字段
+    const docCountMap = new Map<string, number>()
+    const valueCountMap = new Map<string, number>()
+    const latestByDoc = new Map<string, any>()
     for (const r of rows) {
-      valueCount.set(r.value_json, (valueCount.get(r.value_json) || 0) + 1)
+      const docId = r.source_document_id || '__null__'
+      const prevTs = latestByDoc.get(docId)?.created_at || ''
+      if (r.created_at >= prevTs) {
+        latestByDoc.set(docId, r)
+      }
+      if (r.source_document_id) {
+        docCountMap.set(docId, (docCountMap.get(docId) || 0) + 1)
+      }
+      valueCountMap.set(r.value_json, (valueCountMap.get(r.value_json) || 0) + 1)
     }
+    // 过滤掉 null doc（用户手动编辑），只统计有文档来源的
+    const distinctSourceCount = [...docCountMap.entries()].filter(([k]) => k !== '__null__').length
+    const hasValueConflict = distinctSourceCount >= 2
 
     const candidates = rows.map((r) => {
       let parsedValue: any
@@ -928,7 +1012,7 @@ router.get('/:patientId/ehr-field-candidates', (req: Request, res: Response) => 
         confidence: r.confidence ?? null,
         created_by: r.created_by || null,
         created_at: r.created_at,
-        occurrence_count: valueCount.get(r.value_json) || 1,
+        occurrence_count: valueCountMap.get(r.value_json) || 1,
       }
     })
 
@@ -948,8 +1032,8 @@ router.get('/:patientId/ehr-field-candidates', (req: Request, res: Response) => 
         candidates,
         selected_candidate_id: selectedRow?.selected_candidate_id || null,
         selected_value: selectedValue,
-        has_value_conflict: valueCount.size > 1,
-        distinct_value_count: valueCount.size,
+        has_value_conflict: hasValueConflict,
+        distinct_value_count: distinctSourceCount,
       },
     })
   } catch (err: any) {
@@ -965,28 +1049,30 @@ router.get('/:patientId/ehr-field-candidates', (req: Request, res: Response) => 
 /**
  * POST /api/v1/patients/:patientId/ehr-field-candidates/select
  *
- * 用户从候选值列表点击"采用此值"：
- *   1. 校验候选存在且属于当前 instance
+ * 用户从候选值列表点击"采用此值"，或手工编辑字段值：
+ *   1. 候选选择时校验候选存在且属于当前 instance；手工编辑时使用 selected_value
  *   2. UPSERT field_value_selected
- *   3. 追加一条 created_by='user' 的审计 candidate（保留溯源）
+ *   3. 仅手工编辑追加一条 created_by='user' 的候选；采用已有候选不新增候选
  *
  * Body:
  *   - field_path (required) — 用户点击时所处的字段路径
- *   - candidate_id (required)
+ *   - candidate_id (optional when selected_value is provided)
+ *   - selected_value (optional) — 手工编辑值
  *   - project_id (optional) — 项目 CRF 模式
  */
 router.post('/:patientId/ehr-field-candidates/select', (req: Request, res: Response) => {
   try {
-    const { patientId } = req.params
-    const { field_path: rawFieldPath, candidate_id: candidateId, project_id: projectIdRaw } =
+    const patientId = String(req.params.patientId || '')
+    const { field_path: rawFieldPath, candidate_id: candidateId, selected_value: selectedValueRaw, project_id: projectIdRaw } =
       req.body || {}
     const projectIdParam = typeof projectIdRaw === 'string' ? projectIdRaw.trim() : ''
+    const hasManualValue = Object.prototype.hasOwnProperty.call(req.body || {}, 'selected_value')
 
-    if (!rawFieldPath || !candidateId) {
+    if (!rawFieldPath || (!candidateId && !hasManualValue)) {
       return res.status(400).json({
         success: false,
         code: 400,
-        message: '缺少 field_path 或 candidate_id',
+        message: '缺少 field_path，或缺少 candidate_id/selected_value',
       })
     }
 
@@ -999,16 +1085,13 @@ router.post('/:patientId/ehr-field-candidates/select', (req: Request, res: Respo
       })
     }
 
-    // 候选必须属于当前 instance，并拿到它的 value/source 用于 UPSERT 和审计
-    const candidate = db
-      .prepare(
-        `SELECT id, instance_id, field_path, value_json, value_type,
-                source_document_id, source_page, source_block_id, source_bbox_json,
-                source_text, confidence
-         FROM field_value_candidates
-         WHERE id = ? AND instance_id = ?`
-      )
-      .get(candidateId, instance.id) as
+    // 固化目标路径：优先使用前端请求的具体路径（含索引），fallback 到候选记录自身的 field_path
+    // 这样 UI 点击 /治疗情况/药物/0/名称 时，selected 记录落在该具体位置，不会污染同组其它行
+    const targetFieldPath = rawFieldPath.startsWith('/')
+      ? rawFieldPath
+      : '/' + rawFieldPath.replace(/\./g, '/')
+
+    let candidate:
       | {
           id: string
           instance_id: string
@@ -1024,38 +1107,49 @@ router.post('/:patientId/ehr-field-candidates/select', (req: Request, res: Respo
         }
       | undefined
 
-    if (!candidate) {
-      return res.status(404).json({
-        success: false,
-        code: 404,
-        message: '候选不存在或不属于该患者的 schema instance',
-      })
+    if (candidateId) {
+      // 候选必须属于当前 instance，并拿到它的 value/source 用于 UPSERT 和审计
+      candidate = db
+        .prepare(
+          `SELECT id, instance_id, field_path, value_json, value_type,
+                  source_document_id, source_page, source_block_id, source_bbox_json,
+                  source_text, confidence
+           FROM field_value_candidates
+           WHERE id = ? AND instance_id = ?`
+        )
+        .get(candidateId, instance.id) as typeof candidate
+
+      if (!candidate) {
+        return res.status(404).json({
+          success: false,
+          code: 404,
+          message: '候选不存在或不属于该患者的 schema instance',
+        })
+      }
+
+      // 允许：field_path 与候选自身 field_path 在归一化集合里同源即可
+      const allowedPaths = new Set(buildSelectableCandidateFieldPaths(rawFieldPath))
+      if (!allowedPaths.has(candidate.field_path)) {
+        return res.status(409).json({
+          success: false,
+          code: 409,
+          message: '候选的 field_path 与请求不匹配',
+          data: {
+            candidate_field_path: candidate.field_path,
+            requested_field_path: rawFieldPath,
+          },
+        })
+      }
     }
 
-    // 允许：field_path 与候选自身 field_path 在归一化集合里同源即可
-    const allowedPaths = new Set(buildCandidateFieldPaths(rawFieldPath))
-    if (!allowedPaths.has(candidate.field_path)) {
-      return res.status(409).json({
-        success: false,
-        code: 409,
-        message: '候选的 field_path 与请求不匹配',
-        data: {
-          candidate_field_path: candidate.field_path,
-          requested_field_path: rawFieldPath,
-        },
-      })
-    }
-
-    // 固化目标路径：优先使用前端请求的具体路径（含索引），fallback 到候选记录自身的 field_path
-    // 这样 UI 点击 /治疗情况/药物/0/名称 时，selected 记录落在该具体位置，不会污染同组其它行
-    const targetFieldPath = rawFieldPath.startsWith('/')
-      ? rawFieldPath
-      : '/' + rawFieldPath.replace(/\./g, '/')
+    const selectedValue = hasManualValue ? selectedValueRaw : parseStoredValue(candidate!.value_json)
+    const selectedValueJson = JSON.stringify(selectedValue)
+    const selectedValueType = hasManualValue ? inferValueType(selectedValue) : candidate!.value_type
 
     const upsertSelected = db.prepare(`
       INSERT INTO field_value_selected
-        (id, instance_id, field_path, selected_candidate_id, selected_value_json, selected_by)
-      VALUES (?, ?, ?, ?, ?, 'user')
+        (id, instance_id, section_instance_id, row_instance_id, field_path, selected_candidate_id, selected_value_json, selected_by)
+      VALUES (?, ?, ?, ?, ?, ?, ?, 'user')
       ON CONFLICT(instance_id, COALESCE(section_instance_id, '__null__'), COALESCE(row_instance_id, '__null__'), field_path)
       DO UPDATE SET
         selected_candidate_id = excluded.selected_candidate_id,
@@ -1064,7 +1158,7 @@ router.post('/:patientId/ehr-field-candidates/select', (req: Request, res: Respo
         updated_at            = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
     `)
 
-    // 审计：用户采用某候选 = 手动修改事件，带上原候选的溯源信息，created_by='user'
+    // 只有手工编辑才新增候选；采用已有候选只更新 selected 指针。
     const insertAuditCandidate = db.prepare(`
       INSERT INTO field_value_candidates
         (id, instance_id, field_path, value_json, value_type,
@@ -1073,52 +1167,48 @@ router.post('/:patientId/ehr-field-candidates/select', (req: Request, res: Respo
       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'user')
     `)
 
-    const auditId = randomUUID()
     const selectedId = randomUUID()
+    const selectedPosition = resolveSelectedPosition(instance.id, targetFieldPath)
+    const selectedCandidateId = candidate?.id || randomUUID()
 
     const doSelect = db.transaction(() => {
-      insertAuditCandidate.run(
-        auditId,
-        instance.id,
-        targetFieldPath,
-        candidate.value_json,
-        candidate.value_type,
-        candidate.source_document_id,
-        candidate.source_page,
-        candidate.source_block_id,
-        candidate.source_bbox_json,
-        // 标记来源为"采用候选"，便于历史记录里识别
-        `用户采用候选 ${candidate.id}`,
-        candidate.confidence
-      )
-      // 绑定到新生成的审计 candidate，保留"当前值 = 用户手动选择"的语义
-      // 这样修改历史时间轴里会多一条 manual_edit 条目，且 candidates 仍可复用旧 id
+      if (!candidate) {
+        insertAuditCandidate.run(
+          selectedCandidateId,
+          instance.id,
+          targetFieldPath,
+          selectedValueJson,
+          selectedValueType,
+          null,
+          null,
+          null,
+          null,
+          '用户手动编辑',
+          null
+        )
+      }
+
       upsertSelected.run(
         selectedId,
         instance.id,
+        selectedPosition.sectionInstanceId,
+        selectedPosition.rowInstanceId,
         targetFieldPath,
-        auditId,
-        candidate.value_json
+        selectedCandidateId,
+        selectedValueJson
       )
     })
 
     doSelect()
 
-    let selectedValue: any = null
-    try {
-      selectedValue = JSON.parse(candidate.value_json)
-    } catch {
-      selectedValue = candidate.value_json
-    }
-
     return res.json({
       success: true,
       code: 0,
-      message: '已采用此值',
+      message: candidate ? '已采用此值' : '保存成功',
       data: {
         field_path: targetFieldPath,
-        selected_candidate_id: auditId,
-        source_candidate_id: candidate.id,
+        selected_candidate_id: selectedCandidateId,
+        source_candidate_id: candidate?.id || null,
         selected_value: selectedValue,
       },
     })
@@ -1133,4 +1223,3 @@ router.post('/:patientId/ehr-field-candidates/select', (req: Request, res: Respo
 })
 
 export default router
-

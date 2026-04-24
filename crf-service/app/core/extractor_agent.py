@@ -16,10 +16,12 @@ EHR Extractor Agent — 基于 Google ADK 的电子病历结构化抽取器
 """
 
 import asyncio
+import contextvars
 import hashlib
 import json
 import logging
 import os
+import sqlite3
 import time
 import traceback
 from pathlib import Path
@@ -270,12 +272,194 @@ def _append_llm_jsonl_log(record: Dict[str, Any]) -> None:
     try:
         path = _LLM_JSONL_FILE.resolve()
         path.parent.mkdir(parents=True, exist_ok=True)
+        ctx = _llm_context.get() or {}
         payload = dict(record)
+        # 把上下文字段（job_id / patient_id / schema_id）顺手写进 JSONL，方便
+        # admin 详情接口在没迁移到 DB 时也能用 job_id 直查 JSONL。
+        for k in ("job_id", "patient_id", "schema_id"):
+            v = ctx.get(k)
+            if v and k not in payload:
+                payload[k] = v
         payload.setdefault("logged_at", datetime.now(timezone.utc).isoformat())
         with open(path, "a", encoding="utf-8") as f:
             f.write(_safe_json_dumps(payload) + "\n")
     except OSError as exc:
         logger.warning("写入 LLM JSONL 日志失败: %s", exc)
+    # JSONL 之外再写一份结构化 DB 行（llm_call_logs）。失败不阻塞主流程。
+    try:
+        _write_llm_db_log(record)
+    except Exception as exc:  # pragma: no cover
+        logger.warning("写入 LLM 数据库日志失败: %s", exc)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# LLM 调用上下文（异步安全）+ SQLite 双写
+# ═══════════════════════════════════════════════════════════════════════════════
+#
+# 由 `node_extract_units` 在进入节点前通过 `_llm_context.set({...})` 注入
+# job_id / patient_id / schema_id / document_id 等上下文。随后同一协程（及其
+# 子协程）里的 `_append_llm_jsonl_log` 能自动读到这些字段，不必改 agent 调用签名。
+
+_llm_context: contextvars.ContextVar[Dict[str, Any]] = contextvars.ContextVar(
+    "_llm_context", default={}
+)
+
+try:
+    from app.config import settings as _cfg_for_db
+    _LLM_DB_PATH: Optional[Path] = Path(_cfg_for_db.DB_PATH)
+except Exception:  # pragma: no cover
+    _LLM_DB_PATH = None
+
+
+def _llm_db_conn() -> Optional[sqlite3.Connection]:
+    if not _LLM_DB_PATH:
+        return None
+    try:
+        conn = sqlite3.connect(str(_LLM_DB_PATH), timeout=15)
+        conn.execute("PRAGMA journal_mode=WAL")
+        return conn
+    except Exception as exc:  # pragma: no cover
+        logger.warning("打开 LLM DB 连接失败: %s", exc)
+        return None
+
+
+def _json_for_db(value: Any) -> Optional[str]:
+    if value is None:
+        return None
+    if isinstance(value, str):
+        return value
+    try:
+        return json.dumps(value, ensure_ascii=False, default=str)
+    except Exception:
+        return str(value)
+
+
+def _write_llm_db_log(record: Dict[str, Any]) -> None:
+    """
+    把 JSONL 的一条事件同步写进 llm_call_logs 表，采用 UPSERT 策略：
+        - request   事件 → INSERT（status=pending）
+        - response  事件 → UPDATE 成 success，写回解析结果 / validation_log
+        - exception 事件 → UPDATE 成 error，写 error_message / traceback
+
+    Schema 见 backend/src/db.ts（llmCallLogsDdl）。
+    """
+    kind = record.get("kind")
+    call_id = record.get("call_id")
+    if not call_id or kind not in ("llm_request", "llm_response", "llm_exception"):
+        return
+    conn = _llm_db_conn()
+    if conn is None:
+        return
+    try:
+        ctx = _llm_context.get() or {}
+        job_id = ctx.get("job_id")
+        patient_id = ctx.get("patient_id")
+        schema_id = ctx.get("schema_id")
+        document_id = record.get("document_id") or ctx.get("document_id")
+        task_name = record.get("task_name")
+        task_path = _json_for_db(record.get("task_path"))
+        started_at = record.get("started_at")
+        finished_at = record.get("finished_at")
+        elapsed_ms = record.get("elapsed_ms")
+        now = datetime.now(timezone.utc).isoformat()
+
+        if kind == "llm_request":
+            conn.execute(
+                """
+                INSERT INTO llm_call_logs (
+                    call_id, job_id, document_id, patient_id, schema_id,
+                    task_name, task_path, kind, status,
+                    started_at, instruction, user_message,
+                    created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?, ?, ?)
+                ON CONFLICT(call_id) DO UPDATE SET
+                    job_id      = COALESCE(llm_call_logs.job_id, excluded.job_id),
+                    document_id = COALESCE(llm_call_logs.document_id, excluded.document_id),
+                    patient_id  = COALESCE(llm_call_logs.patient_id, excluded.patient_id),
+                    schema_id   = COALESCE(llm_call_logs.schema_id, excluded.schema_id),
+                    task_name   = COALESCE(llm_call_logs.task_name, excluded.task_name),
+                    task_path   = COALESCE(llm_call_logs.task_path, excluded.task_path),
+                    instruction = excluded.instruction,
+                    user_message= excluded.user_message,
+                    updated_at  = excluded.updated_at
+                """,
+                (
+                    call_id, job_id, document_id, patient_id, schema_id,
+                    task_name, task_path, "request",
+                    started_at,
+                    _json_for_db(record.get("instruction")),
+                    _json_for_db(record.get("user_message")),
+                    now, now,
+                ),
+            )
+        elif kind == "llm_response":
+            conn.execute(
+                """
+                INSERT INTO llm_call_logs (
+                    call_id, job_id, document_id, patient_id, schema_id,
+                    task_name, task_path, kind, status,
+                    started_at, finished_at, elapsed_ms,
+                    extracted_raw, parsed, validation_log, stream_events,
+                    created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'success', ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(call_id) DO UPDATE SET
+                    kind           = excluded.kind,
+                    status         = 'success',
+                    finished_at    = excluded.finished_at,
+                    elapsed_ms     = excluded.elapsed_ms,
+                    extracted_raw  = excluded.extracted_raw,
+                    parsed         = excluded.parsed,
+                    validation_log = excluded.validation_log,
+                    stream_events  = excluded.stream_events,
+                    updated_at     = excluded.updated_at
+                """,
+                (
+                    call_id, job_id, document_id, patient_id, schema_id,
+                    task_name, task_path, "response",
+                    started_at, finished_at, elapsed_ms,
+                    _json_for_db(record.get("extracted_raw")),
+                    _json_for_db(record.get("parsed")),
+                    _json_for_db(record.get("validation_log")),
+                    _json_for_db(record.get("stream_events")),
+                    now, now,
+                ),
+            )
+        elif kind == "llm_exception":
+            conn.execute(
+                """
+                INSERT INTO llm_call_logs (
+                    call_id, job_id, document_id, patient_id, schema_id,
+                    task_name, task_path, kind, status,
+                    started_at, finished_at, elapsed_ms,
+                    error_message, traceback_text, stream_events,
+                    created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'error', ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(call_id) DO UPDATE SET
+                    kind          = excluded.kind,
+                    status        = 'error',
+                    finished_at   = excluded.finished_at,
+                    elapsed_ms    = excluded.elapsed_ms,
+                    error_message = excluded.error_message,
+                    traceback_text= excluded.traceback_text,
+                    stream_events = excluded.stream_events,
+                    updated_at    = excluded.updated_at
+                """,
+                (
+                    call_id, job_id, document_id, patient_id, schema_id,
+                    task_name, task_path, "exception",
+                    started_at, finished_at, elapsed_ms,
+                    record.get("error"),
+                    record.get("traceback"),
+                    _json_for_db(record.get("stream_events")),
+                    now, now,
+                ),
+            )
+        conn.commit()
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
 
 
 for _noisy in ("LiteLLM", "litellm", "google.adk", "google.genai", "httpx"):
@@ -504,6 +688,14 @@ def _get_value_at_pointer(node: Any, pointer: str) -> Any:
     return cur
 
 
+def _pointer_exists(node: Any, pointer: str) -> bool:
+    try:
+        _get_value_at_pointer(node, pointer)
+        return True
+    except Exception:
+        return False
+
+
 def _normalize_audit_fields(fields: Dict[str, Any]) -> Dict[str, Any]:
     normalized: Dict[str, Any] = {}
     for raw_key, value in fields.items():
@@ -526,6 +718,12 @@ def _validate_audit_fields(result_val: Any, fields: Dict[str, Any]) -> Dict[str,
     leaf_paths = _collect_leaf_result_paths(result_val)
     if leaf_paths and not normalized:
         raise ExtractionValidationError("audit.fields 不能为空，必须覆盖 result 的叶子字段")
+
+    normalized = {
+        path: entry
+        for path, entry in normalized.items()
+        if path in leaf_paths or not _pointer_exists(result_val, path)
+    }
 
     for path, entry in normalized.items():
         if not path.startswith("/"):
@@ -663,10 +861,14 @@ def _validate_extraction_output(
             ]
         return obj
 
-    if result_val is not None:
-        result_val = _sanitize_empty_strings(result_val)
-        parsed["result"] = result_val
-
+    # ── 修复 "audit.fields 存在未在 result 中出现的路径" 死循环 ─────────────
+    # 原实现先 sanitize 再校验，导致 result 里 "" / null 字段被删后，audit 里仍持
+    # 有这些路径，于是每轮校验都挑一个被删字段报错，模型追着删字段但 audit 删不
+    # 完 → LoopAgent 3 轮后失败。
+    #
+    # 正确顺序：**先用原始 result 校验 audit.fields 的完整性**（此时空值叶子仍
+    # 在），校验通过后再做 sanitize，并同步剔除 audit.fields 里已被 sanitize 清
+    # 掉的路径。这样既保持持久化结果里不带空值，又不误伤模型的合规输出。
     audit = parsed.get("audit")
     if audit is not None and not isinstance(audit, dict):
         raise ExtractionValidationError("'audit' 必须是对象", raw_output=raw)
@@ -676,6 +878,17 @@ def _validate_extraction_output(
             raise ExtractionValidationError("'audit.fields' 必须是对象", raw_output=raw)
         if result_val is not None and fields is not None:
             audit["fields"] = _validate_audit_fields(result_val, fields)
+
+    if result_val is not None:
+        result_val = _sanitize_empty_strings(result_val)
+        parsed["result"] = result_val
+        # 清 audit.fields 里已失去承载的路径，避免 materializer 按 audit 遍历时
+        # 找不到 result 对应叶子。
+        if isinstance(audit, dict) and isinstance(audit.get("fields"), dict):
+            surviving = _collect_leaf_result_paths(result_val)
+            audit["fields"] = {
+                k: v for k, v in audit["fields"].items() if k in surviving
+            }
 
     if (
         root_schema is not None

@@ -41,6 +41,12 @@ class Settings:
     # ── 并发 ───────────────────────────────────────────────────────────────
     MAX_CONCURRENT_EXTRACTIONS: int = int(os.getenv("CRF_MAX_CONCURRENT", "2"))
 
+    # ── 僵尸任务回收 ───────────────────────────────────────────────────────
+    # FastAPI 启动时扫描超过该分钟数仍处于 running 的 ehr_extraction_jobs，
+    # 判定为上次 worker 崩溃 / 被 kill 留下的僵尸并自动置为 cancelled。
+    # 同时把关联 documents.extract_status 从 running 回退到 pending，允许重抽。
+    EXTRACTION_STALE_MINUTES: int = int(os.getenv("CRF_EXTRACTION_STALE_MINUTES", "15"))
+
     # ── 日志 ───────────────────────────────────────────────────────────────
     LOG_DIR: Path = _SERVICE_DIR / "logs"
     LOG_LEVEL: str = os.getenv("LOG_LEVEL", "INFO")

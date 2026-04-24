@@ -69,12 +69,31 @@ class Materializer:
             if not isinstance(task_results, list):
                 task_results = []
 
-            # 构建 source_id → bbox 映射（用于溯源高亮）
-            source_id_to_bbox: Dict[str, Any] = {}
+            # 构建 source_id → 坐标映射（用于溯源高亮）。TextIn position/bbox 为
+            # 解析页面图像像素坐标，page_width/page_height 用于前端等比映射到 PDF canvas。
+            source_id_to_info: Dict[str, Any] = {}
             if content_list:
                 for chunk in content_list:
-                    if chunk.get("id") and chunk.get("bbox"):
-                        source_id_to_bbox[chunk["id"]] = chunk["bbox"]
+                    chunk_id = chunk.get("id")
+                    bbox = chunk.get("bbox")
+                    if chunk_id and bbox:
+                        page_w = chunk.get("page_width")
+                        page_h = chunk.get("page_height")
+                        if page_w and page_h:
+                            # 新版格式：归一化坐标 + 原图尺寸
+                            source_id_to_info[chunk_id] = {
+                                "bbox": bbox,
+                                "page_width": page_w,
+                                "page_height": page_h,
+                                "position": chunk.get("position"),
+                                "page_angle": chunk.get("page_angle"),
+                            }
+                        else:
+                            source_id_to_info[chunk_id] = {
+                                "bbox": bbox,
+                                "position": chunk.get("position"),
+                                "page_angle": chunk.get("page_angle"),
+                            }
 
             for task in task_results:
                 if not isinstance(task, dict):
@@ -111,7 +130,7 @@ class Materializer:
                             audit_fields=audit_fields or {},
                             document_id=document_id,
                             extraction_run_id=run_id,
-                            source_id_to_bbox=source_id_to_bbox,
+                            source_id_to_info=source_id_to_info,
                         )
                 else:
                     section_instance_id = self.repo.ensure_section_instance(
@@ -132,7 +151,7 @@ class Materializer:
                         audit_fields=audit_fields or {},
                         document_id=document_id,
                         extraction_run_id=run_id,
-                        source_id_to_bbox=source_id_to_bbox,
+                        source_id_to_info=source_id_to_info,
                     )
 
             self.repo.finalize_extraction_run(conn, run_id, "succeeded", None)
@@ -153,7 +172,7 @@ class Materializer:
         audit_fields: Dict[str, Any],
         document_id: str,
         extraction_run_id: str,
-        source_id_to_bbox: Dict[str, Any],
+        source_id_to_info: Dict[str, Any],
         parent_row_id: Optional[str] = None,
     ) -> None:
         """递归遍历抽取结果树，将叶子节点写入 field_value_candidates。"""
@@ -169,7 +188,7 @@ class Materializer:
                     audit_fields=audit_fields,
                     document_id=document_id,
                     extraction_run_id=extraction_run_id,
-                    source_id_to_bbox=source_id_to_bbox,
+                    source_id_to_info=source_id_to_info,
                     parent_row_id=parent_row_id,
                 )
             return
@@ -197,7 +216,7 @@ class Materializer:
                     audit_fields=audit_fields,
                     document_id=document_id,
                     extraction_run_id=extraction_run_id,
-                    source_id_to_bbox=source_id_to_bbox,
+                    source_id_to_info=source_id_to_info,
                     parent_row_id=child_row_id,
                 )
             return
@@ -212,8 +231,8 @@ class Materializer:
         source_text = audit_entry.get("raw") if isinstance(audit_entry, dict) else None
 
         source_bbox = None
-        if source_block_id and source_id_to_bbox:
-            source_bbox = source_id_to_bbox.get(source_block_id)
+        if source_block_id and source_id_to_info:
+            source_bbox = source_id_to_info.get(source_block_id)
             if source_bbox is not None:
                 source_bbox = json.dumps(source_bbox, ensure_ascii=False)
 

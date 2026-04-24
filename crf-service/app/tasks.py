@@ -133,7 +133,36 @@ def run_extraction_task(
     # 执行 LangGraph 图
     try:
         graph = build_graph()
-        final_state = asyncio.run(graph.ainvoke(initial_state))
+
+        # 用 astream("updates") 逐节点捕获进度，并向 Redis 频道 publish，
+        # 这样前端 SSE 才能看到 load_schema_and_docs → filter_units → extract_units
+        # → materialize 的逐步推进（而不是只有开头/结尾两条）。
+        async def _run_with_progress() -> Dict[str, Any]:
+            accumulated: Dict[str, Any] = {}
+            async for chunk in graph.astream(initial_state, stream_mode="updates"):
+                if not isinstance(chunk, dict):
+                    continue
+                for node_name, node_out in chunk.items():
+                    if not isinstance(node_out, dict):
+                        continue
+                    # 节点返回的 partial state 同步进 accumulated，保证最终 state 完整。
+                    accumulated.update(node_out)
+                    prog = node_out.get("progress")
+                    if not prog:
+                        continue
+                    progress_payload = {
+                        "status": "running",
+                        "node": node_name,
+                    }
+                    if isinstance(prog, dict):
+                        # node 自己填的 progress 字段优先，但 node_name 始终以图节点名为准。
+                        progress_payload.update({k: v for k, v in prog.items() if k != "node"})
+                    else:
+                        progress_payload["message"] = str(prog)
+                    _publish_progress(actual_job_id, progress_payload)
+            return accumulated
+
+        final_state = asyncio.run(_run_with_progress())
 
         elapsed_ms = int((time.time() - t0) * 1000)
 

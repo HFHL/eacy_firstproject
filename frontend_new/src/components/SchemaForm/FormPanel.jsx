@@ -486,8 +486,8 @@ const EmptyFormMask = ({ isRepeatable, onActivate }) => (
 /**
  * 表单面板主组件
  */
-const FormToolbar = ({ toolbarProps, onUploadDocument, beforeUploadActions = null, beforeAutoActions = null }) => {
-  if (!toolbarProps && !onUploadDocument && !beforeUploadActions && !beforeAutoActions) return null
+const FormToolbar = ({ toolbarProps, onUploadDocument, beforeUploadActions = null }) => {
+  if (!toolbarProps && !onUploadDocument && !beforeUploadActions) return null
   const { onSave, onReset, saving, autoSaveEnabled, onToggleAutoSave, isDirty } = toolbarProps || {}
   return (
     <Space size={6} style={{ flexShrink: 0 }}>
@@ -497,7 +497,6 @@ const FormToolbar = ({ toolbarProps, onUploadDocument, beforeUploadActions = nul
       )}
       {toolbarProps && (
         <>
-          {beforeAutoActions}
           <Tooltip title={autoSaveEnabled ? '关闭自动保存' : '开启自动保存'}>
             <Button
               type={autoSaveEnabled ? 'primary' : 'default'}
@@ -518,14 +517,13 @@ const FormToolbar = ({ toolbarProps, onUploadDocument, beforeUploadActions = nul
   )
 }
 
-const FormPanel = ({ 
+const FormPanel = ({
   style,
   onPathChange,
   onFieldSelect,
   toolbarProps,
   onUploadDocument,
-  beforeUploadActions = null,
-  beforeAutoActions = null
+  beforeUploadActions = null
 }) => {
   const { 
     schema, 
@@ -753,7 +751,7 @@ const FormPanel = ({
       <FormHeader
         title={currentTitle}
         schemaNode={currentSchema}
-        actions={<FormToolbar toolbarProps={toolbarProps} onUploadDocument={onUploadDocument} beforeUploadActions={beforeUploadActions} beforeAutoActions={beforeAutoActions} />}
+        actions={<FormToolbar toolbarProps={toolbarProps} onUploadDocument={onUploadDocument} beforeUploadActions={beforeUploadActions} />}
       />
 
       <div

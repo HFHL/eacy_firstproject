@@ -12,6 +12,7 @@ import {
 } from '@ant-design/icons'
 import ConfidenceIndicator from './ConfidenceIndicator'
 import StatusIndicator from './StatusIndicator'
+import EhrExtractionBadge from './EhrExtractionBadge'
 import { appThemeToken } from '../../../../../styles/themeTokens'
 import './DocumentCard.css'
 
@@ -106,10 +107,11 @@ const DocumentCard = ({
            <div className="document-indicators">
              <Space direction="vertical" size="small" align="end">
                <ConfidenceIndicator confidence={document.confidence} />
-               <StatusIndicator 
-                 status={document.status} 
+               <StatusIndicator
+                 status={document.status}
                  extractedFieldsCount={document.extractedFields?.length || 0}
                />
+               <EhrExtractionBadge extractStatus={document.extract_status} />
              </Space>
            </div>
            <Text type="secondary" style={{ fontSize: '12px', marginTop: '8px' }}>

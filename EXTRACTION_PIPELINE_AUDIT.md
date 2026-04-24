@@ -360,6 +360,13 @@ backend (Node/Express)                       crf-service (FastAPI + Celery + Lan
 1. `node_materialize` 对所有 batch 文档（即便没写 candidate）显式调 `mark_extract_failed('no_matching_form')` 或 `mark_extract_success` 的"空骨架"版本。
 2. 或者反过来：`run_extraction_task` 只更新真正抽到内容的 sibling job，其余标为 `skipped`。
 3. `shouldAutoTriggerExtract` 增加判断：`ehr_extraction_jobs.status IN ('completed','failed')` 也视为"已触发过"。
+4. **僵尸 running 兜底**（2026-04-23 已完成）：`crf-service/app/main.py` lifespan
+   startup 会扫描 `status='running'` 且 `started_at < now - CRF_EXTRACTION_STALE_MINUTES`
+   （默认 15 分钟）的 `ehr_extraction_jobs`，置为 `cancelled`，同时把关联
+   `documents.extract_status / materialize_status='running'` 回退到 `pending`
+   （已 `completed` 的物化状态不动）。覆盖 "worker 被 SIGKILL / 崩溃"留下的
+   running 僵尸导致前端永远无法重抽的场景。测试：
+   `tests/test_stale_running_sweep.py`（4 case）。
 
 ---
 
@@ -579,6 +586,53 @@ backend (Node/Express)                       crf-service (FastAPI + Celery + Lan
 
 ---
 
+## P25 🔴 `_validate_extraction_output` 先 sanitize 再校验 audit，导致合规输出被 3 轮拒绝
+
+**一句话**：模型正确输出 `"字段": ""` / `"字段": null`（"无证据"语义）时，`_sanitize_empty_strings` 先把这些叶子从 `result` 里删掉，再拿"已瘦身的 result"跟 `audit.fields` 对比，于是一定报 `audit.fields 存在未在 result 中出现的路径`，LoopAgent 重试 3 次都挑不同字段触发同一错误，整个 task 抽取失败。
+
+**原因**（`crf-service/app/core/extractor_agent.py::_validate_extraction_output`）：
+```python
+result_val = _sanitize_empty_strings(result_val)    # 先删空值 / null 叶子
+parsed["result"] = result_val
+...
+if result_val is not None and fields is not None:
+    audit["fields"] = _validate_audit_fields(result_val, fields)   # 再用已删的 result 校验
+```
+- `_sanitize_empty_strings` 递归丢弃 `v == ""` 或 `v is None` 的 k/v；
+- `_validate_audit_fields` 要求 audit 的每个 path 都能在 result 叶子路径里找到 → 被删掉的路径必然命中错误。
+
+**复现**（生产 `crf-service/logs/ehr_extractor_llm.jsonl` 2026-04-23 batch）：同一 task `基本信息 / 人口学情况`、同一文档连续 6 次 `llm_exception`，错误路径轮换：
+- 轮次 0：`/身份信息/曾用名姓名`（result 里是 `""`）
+- 轮次 1：`/紧急联系人/0/电话`（result 里是 `null`）
+- 轮次 2：`/人口统计学/教育水平`（result 里是 `""`）
+
+模型按 format_validator 的反馈每轮都尝试删 result 里的"违规字段"，但 audit 没同步删，结果永远挑下一个空值字段报错。
+
+**后果**：
+- 任何 OCR 文档只要有部分字段在原文里没出现（极常见），整块 task 就会 100% 失败；
+- admin 页面看到一串 `failed` 任务，日志里塞满"路径不在 result"，实际模型输出完全合规；
+- Step 3a 双写上线后，`llm_call_logs` 里每条 pending 都演变成 error。
+
+**方案**：调换顺序 + 同步清 audit。实现（已落地）：
+```python
+# 1) 用原始 result 校验 audit（空值叶子此时还在）
+audit["fields"] = _validate_audit_fields(result_val, fields)
+# 2) 校验通过后再 sanitize
+result_val = _sanitize_empty_strings(result_val)
+parsed["result"] = result_val
+# 3) 清 audit.fields 里已失去承载的路径，避免 materializer 下游踩空
+surviving = _collect_leaf_result_paths(result_val)
+audit["fields"] = {k: v for k, v in audit["fields"].items() if k in surviving}
+```
+
+**状态**：✅ 2026-04-23 修复。新增 `crf-service/tests/test_sanitize_vs_audit.py`：
+- 正向回归：`""` / `null` 叶子 + 完整 audit 应通过，且 sanitize 后 audit 中对应条目被清理；
+- 边界 1：模型幻觉出 result 外的路径仍应抛 `audit.fields 存在未在 result 中出现的路径`；
+- 边界 2：audit 漏覆盖 result 非空叶子仍应抛 `audit.fields 未覆盖所有 result 叶子字段`。
+- 全套 18 测试通过。
+
+---
+
 ## 修复优先级路线图
 
 ### Sprint 1（必须修，1–2 周）
@@ -613,6 +667,7 @@ backend (Node/Express)                       crf-service (FastAPI + Celery + Lan
 19. **P20** prompt_version / model_name 可追溯
 20. **P21** LLM 日志并发安全
 21. **P23** 跨项目重复抽取去重
+22. **P24** `result_extraction_run_id` 字段语义校正（临时已在 admin 详情层做 fallback）
 
 ---
 
@@ -671,3 +726,98 @@ backend (Node/Express)                       crf-service (FastAPI + Celery + Lan
 - `tests/test_job_lifecycle.py`（4 case）：P3/P14
 - `tests/test_prompt_format.py`（2 case）：P7
 - `pytest.ini`：pytest 配置
+
+### 管理员 UI - 抽取任务监控（2026-04-23）
+
+**目标**：让 `http://localhost:5173/admin` 的「抽取任务」Tab 能统一观察
+电子病历夹抽取 / 科研 CRF 抽取 / 靶向抽取，含进度追踪 + 详情弹窗（查看 LLM
+提示词、返回、校验日志）。**不覆盖元数据抽取**。
+
+**后端新增**（`backend/src/routes/admin.ts`，挂到 `/api/v1/admin`）：
+- `GET /admin/extraction-tasks` 统一列表：汇总 `project_extraction_tasks` 与独立
+  `ehr_extraction_jobs`，按类型（`project_crf` / `patient_ehr` / `targeted`）+
+  状态/患者/项目过滤；返回进度、type_counts、status_counts。**严格只读**，不触发
+  stale-sweep（规避 P10）。
+- `GET /admin/extraction-tasks/:id` 详情：返回 `summary`、`jobs[]`（含
+  `extraction_run`：target_mode / model / prompt_version / 字段候选数 /
+  证据命中数）、以及 `llm_calls[]`（按 document_id + 时间窗口软关联
+  `crf-service/logs/ehr_extractor_llm.jsonl`，支持 kind ∈ {request, response,
+  exception} 按 call_id 配对）。对 P24 做 fallback：`result_extraction_run_id`
+  实际为 instance_id 时按 instance+document 精确挑选 run。
+
+**前端新增**（`frontend_new/src/pages/Admin/index.jsx` + `api/admin.js`）：
+- `ExtractionTasksTab` 重写：类型分段筛选 + 状态下拉 + 关键词搜索 +
+  Progress 进度条 + 每行点「详情」打开弹窗。
+- `ExtractionTaskDetailModal`：展示 summary (Descriptions)、文档级 Jobs 列表
+  (Table, 含 extraction_run 聚合信息)、LLM 调用列表 `LLMCallList`（折叠卡
+  + Tabs 分 prompt/user_message/parsed/extracted_raw/validation_log/error 五
+  六标签页查看）。
+
+**Step 3a 已完成**（`llm_call_logs` 表 + `extractor_agent` 双写）：
+- `backend/src/db.ts` bootstrap 新建 `llm_call_logs(call_id PK, job_id, document_id,
+  patient_id, schema_id, task_name, task_path, kind, status, started_at,
+  finished_at, elapsed_ms, instruction, user_message, extracted_raw, parsed,
+  validation_log, stream_events, error_message, traceback_text, …)`，带
+  `(job_id)`、`(document_id)`、`(patient_id)`、`(started_at)` 四个索引。启动时
+  幂等执行，不影响已有库。
+- `crf-service/app/core/extractor_agent.py`：
+  * 引入模块级 `contextvars._llm_context`，供 `_append_llm_jsonl_log`、
+    `_write_llm_db_log` 读取当前调用所属的 `job_id / patient_id / schema_id`。
+  * 新增 `_write_llm_db_log(record)`：在写 JSONL 的同时，按 `kind` UPSERT 进
+    `llm_call_logs`：
+      - `llm_request`   → INSERT status=pending，带 instruction + user_message；
+      - `llm_response`  → UPDATE status=success，写 extracted_raw / parsed /
+        validation_log / stream_events / elapsed_ms；
+      - `llm_exception` → UPDATE status=error，写 error_message + traceback。
+    SQLite `ON CONFLICT(call_id) DO UPDATE` 保证三次事件落到同一行。失败仅
+    记日志，不阻塞主流程。
+- `crf-service/app/graph/nodes.py::node_extract_units` 进入前注入
+  `{job_id, patient_id, schema_id}` 到 `_llm_context`，让 agent 内部每次 LLM
+  调用自动带上任务归属，不必改 agent 调用签名。
+- `backend/src/routes/admin.ts`：
+  * 新增 `readLlmCallsFromDb(jobIds)`：按 `job_id` 精确从表里拉 LLM 调用（附带
+    反序列化 task_path / extracted_raw / parsed / validation_log 的 JSON 文本）。
+  * `GET /admin/extraction-tasks/:id` 改为 **DB 优先 + JSONL 兜底**：以
+    call_id 去重合并，并通过 `llm_source ∈ {db, merged, jsonl}` 标明来源。
+    历史任务没有 DB 记录时仍然回退到 JSONL 软关联。
+- 前端 Admin 详情弹窗显示来源标签：`DB 精准` / `DB + JSONL` / `JSONL 软关联`，
+  让运维一眼看清数据链路是否已切换到精准关联。
+
+**生效方式**：Node backend 已由 tsx watch 自动重启，表已建成（`sqlite3
+backend/eacy.db ".schema llm_call_logs"` 可见）；`crf-service` 的 Celery worker
+**需手动重启**（或重启 `start.sh`）才会启用 extractor_agent 双写。重启后新
+发起的 EHR / 靶向 / 项目 CRF 任务都会自动落到表里，admin 详情弹窗里能看到
+"DB 精准"标签。
+
+**Step 3b 已完成（2026-04-23）**：前端 Admin 详情弹窗接入实时 SSE 进度。
+
+改动清单：
+
+1. **crf-service/app/tasks.py**：`run_extraction_task` 把 `graph.ainvoke(...)`
+   换成 `graph.astream(initial_state, stream_mode="updates")`，逐节点捕获
+   `state.progress` 并 `_publish_progress` 到 Redis 频道 `crf:progress:{job_id}`。
+   原先 SSE 只有 `start` / `done` 两条，现在会按顺序推出 `load_schema_and_docs`
+   → `filter_units` → `extract_units` → `materialize` → `done`。
+2. **crf-service/app/main.py**：SSE 终态判断补上 `cancelled`（以前只认
+   `completed/failed`），避免前端订阅已 cancelled 任务时挂着空等 10 分钟。
+3. **backend/src/routes/admin.ts**：新增 `GET /api/v1/admin/extraction-tasks/:id/progress`
+   反代到 `${CRF_SERVICE_URL}/api/extract/{job_id}/progress`。id → job_id
+   映射：project 任务优先取 `project_extraction_tasks.job_ids_json[0]`，
+   否则按 `ehr_extraction_jobs.id` 直查。首先推一条
+   `event: meta` 带上实际 job_id 便于调试；之后原样透传 upstream 的
+   `data: {...}`；upstream 终态结束时同步 `res.end()`。
+4. **frontend_new/src/hooks/useExtractionProgressSSE.js**（新）：基于原生
+   EventSource 的 hook，返回 `{events, lastEvent, status, terminal, error}`。
+   终态（completed/failed/cancelled）到达时主动 `es.close()` 避免默认 3s 自动重连。
+5. **frontend_new/src/pages/Admin/index.jsx**：
+   * 详情弹窗里，当 summary.status ∈ {running, pending} 时调用
+     `useExtractionProgressSSE(taskId, { enabled })`，渲染 `ExtractionProgressStream`
+     时间线（时间戳 + 节点名 + 状态 Tag + 消息）。
+   * SSE `terminal=true` 时 bump `refreshKey` 自动 refetch 一次详情，把
+     summary / jobs / llm_calls 都翻到最终态。
+   * 列表级（`ExtractionTasksTab`）：有 running/pending 任务时启动 5s 轻量
+     REST 轮询（不用 EventSource 每行订阅，规避 HTTP/1.1 的 6 连接同源限制）。
+
+**认证备忘**：`/api/v1/admin/*` 目前无鉴权 middleware，`EventSource` 直接连。
+后续若加上 JWT 认证，需要：把 token 放 querystring 转发、或改用 fetch +
+ReadableStream 手写分帧（原生 EventSource 不能带 header）。

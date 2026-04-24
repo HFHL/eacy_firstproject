@@ -29,6 +29,31 @@ function parseJsonObject(raw: unknown): Record<string, any> {
   }
 }
 
+function parseStoredValue(raw: string) {
+  try {
+    return JSON.parse(raw)
+  } catch {
+    return raw
+  }
+}
+
+function ensureObjectPath(target: any, parts: string[]) {
+  let current = target
+  for (const part of parts) {
+    if (current[part] === undefined || current[part] === null || typeof current[part] !== 'object' || Array.isArray(current[part])) {
+      current[part] = {}
+    }
+    current = current[part]
+  }
+  return current
+}
+
+function setObjectValue(target: any, parts: string[], value: any) {
+  if (parts.length === 0) return
+  const parent = ensureObjectPath(target, parts.slice(0, -1))
+  parent[parts[parts.length - 1]] = value
+}
+
 function parseJsonArray(raw: unknown): any[] {
   if (!raw) return []
   if (Array.isArray(raw)) return raw
@@ -172,6 +197,36 @@ function normalizeBbox(raw: unknown) {
   return parsed
 }
 
+function isMeaningfulCrfValue(value: any) {
+  return value !== null && value !== undefined && value !== ''
+}
+
+function buildFieldPayload(row: any, value: any, fieldName: string) {
+  return {
+    value,
+    field_name: fieldName,
+    source: row.source_document_id ? 'AI抽取' : null,
+    confidence: row.confidence,
+    document_id: row.source_document_id,
+    document_name: row.source_document_name,
+    document_type: row.source_document_type,
+    raw: row.source_text,
+    bbox: normalizeBbox(row.source_bbox_json),
+    page_idx: row.source_page,
+    source_id: row.candidate_id,
+  }
+}
+
+function ensureProjectCrfGroup(groups: Record<string, any>, groupId: string, fieldMap: Record<string, string> = {}) {
+  if (!groups[groupId]) {
+    groups[groupId] = {
+      group_name: fieldMap[groupId] || groupId,
+      fields: {},
+    }
+  }
+  return groups[groupId]
+}
+
 function buildProjectCrfData(patientId: string, schemaId: string | null | undefined, fieldMap: Record<string, string> = {}) {
   const empty = { groups: {}, _extracted_at: null, _extraction_mode: null, _change_logs: [], _task_results: [], _documents: {} }
   if (!schemaId) {
@@ -187,13 +242,112 @@ function buildProjectCrfData(patientId: string, schemaId: string | null | undefi
   `).get(patientId, schemaId) as { id: string } | undefined
 
   if (!instance?.id) {
-    return { crfData: empty, crfCompleteness: '0', instanceId: null }
+    return { crfData: empty, instanceId: null }
   }
 
+  // 构建嵌套 data 结构（与 ehrData.ts 保持一致，支持可重复 section 数组）
+  const draftData: any = {}
+  const selectedRows = db.prepare(`
+    SELECT
+      fvs.field_path,
+      fvs.selected_value_json,
+      fvs.section_instance_id,
+      fvs.row_instance_id,
+      si.section_path,
+      si.repeat_index AS section_repeat_index,
+      si.is_repeatable AS section_is_repeatable,
+      ri.group_path,
+      ri.repeat_index AS row_repeat_index
+    FROM field_value_selected fvs
+    LEFT JOIN section_instances si ON si.id = fvs.section_instance_id
+    LEFT JOIN row_instances ri ON ri.id = fvs.row_instance_id
+    WHERE fvs.instance_id = ?
+    ORDER BY
+      COALESCE(si.section_path, ''),
+      COALESCE(si.repeat_index, 0),
+      COALESCE(ri.group_path, ''),
+      COALESCE(ri.repeat_index, 0),
+      fvs.field_path
+  `).all(instance.id) as any[]
+
+  for (const row of selectedRows) {
+    const path = row.field_path
+    const parts = String(path || '').split('/').filter((p: string) => p !== '')
+    if (parts.length === 0) continue
+
+    const value = parseStoredValue(row.selected_value_json)
+
+    const hasRepeatableSection =
+      !!row.section_instance_id &&
+      typeof row.section_path === 'string' &&
+      !!row.section_path &&
+      Number(row.section_is_repeatable || 0) === 1
+    const hasRepeatableRow = !!row.row_instance_id && typeof row.group_path === 'string' && row.group_path
+
+    if (hasRepeatableSection) {
+      const sectionParts = String(row.section_path).split('/').filter((p: string) => p !== '')
+      const sectionParent = ensureObjectPath(draftData, sectionParts.slice(0, -1))
+      const sectionKey = sectionParts[sectionParts.length - 1]
+      if (!Array.isArray(sectionParent[sectionKey])) {
+        sectionParent[sectionKey] = []
+      }
+
+      const sectionArray = sectionParent[sectionKey]
+      const sectionIndex = Number(row.section_repeat_index || 0)
+      while (sectionArray.length <= sectionIndex) {
+        sectionArray.push({})
+      }
+      if (!sectionArray[sectionIndex] || typeof sectionArray[sectionIndex] !== 'object' || Array.isArray(sectionArray[sectionIndex])) {
+        sectionArray[sectionIndex] = {}
+      }
+
+      const sectionRecord = sectionArray[sectionIndex]
+      const relativeToSection = parts.slice(sectionParts.length)
+
+      if (hasRepeatableRow) {
+        const groupParts = String(row.group_path).split('/').filter((p: string) => p !== '')
+        const relativeGroupParts = groupParts.slice(sectionParts.length)
+        const rowContainer = ensureObjectPath(sectionRecord, relativeGroupParts.slice(0, -1))
+        const rowKey = relativeGroupParts[relativeGroupParts.length - 1]
+        if (!Array.isArray(rowContainer[rowKey])) {
+          rowContainer[rowKey] = []
+        }
+
+        const rowArray = rowContainer[rowKey]
+        const rowIndex = Number(row.row_repeat_index || 0)
+        while (rowArray.length <= rowIndex) {
+          rowArray.push({})
+        }
+        if (!rowArray[rowIndex] || typeof rowArray[rowIndex] !== 'object' || Array.isArray(rowArray[rowIndex])) {
+          rowArray[rowIndex] = {}
+        }
+
+        const relativeToRow = parts.slice(groupParts.length)
+        if (relativeToRow.length === 0) continue
+        setObjectValue(rowArray[rowIndex], relativeToRow, value)
+        continue
+      }
+
+      if (relativeToSection.length === 0) continue
+      setObjectValue(sectionRecord, relativeToSection, value)
+      continue
+    }
+
+    setObjectValue(draftData, parts, value)
+  }
+
+  // 构建 flat groups 结构（向后兼容，含溯源信息）
   const rows = db.prepare(`
     SELECT
       fvs.field_path,
       fvs.selected_value_json,
+      fvs.section_instance_id,
+      fvs.row_instance_id,
+      si.section_path,
+      si.repeat_index AS section_repeat_index,
+      si.is_repeatable AS section_is_repeatable,
+      ri.group_path,
+      ri.repeat_index AS row_repeat_index,
       fvc.id AS candidate_id,
       fvc.source_document_id,
       fvc.source_page,
@@ -203,13 +357,21 @@ function buildProjectCrfData(patientId: string, schemaId: string | null | undefi
       d.file_name AS source_document_name,
       d.document_sub_type AS source_document_type
     FROM field_value_selected fvs
+    LEFT JOIN section_instances si ON si.id = fvs.section_instance_id
+    LEFT JOIN row_instances ri ON ri.id = fvs.row_instance_id
     LEFT JOIN field_value_candidates fvc ON fvc.id = fvs.selected_candidate_id
     LEFT JOIN documents d ON d.id = fvc.source_document_id
     WHERE fvs.instance_id = ?
-    ORDER BY fvs.field_path
+    ORDER BY
+      COALESCE(si.section_path, ''),
+      COALESCE(si.repeat_index, 0),
+      COALESCE(ri.group_path, ''),
+      COALESCE(ri.repeat_index, 0),
+      fvs.field_path
   `).all(instance.id) as any[]
 
   const groups: Record<string, any> = {}
+  const repeatRecordMaps: Record<string, Map<string, any>> = {}
   let totalFields = 0
   let filledFields = 0
 
@@ -219,31 +381,66 @@ function buildProjectCrfData(patientId: string, schemaId: string | null | undefi
     if (parts.length === 0) continue
     const groupId = parts[0]
     const fieldId = parts.slice(1).join('/')
-    if (!groups[groupId]) {
-      groups[groupId] = {
-        group_name: fieldMap[groupId] || groupId,
-        fields: {},
-      }
-    }
+    const group = ensureProjectCrfGroup(groups, groupId, fieldMap)
     const value = decodeSelectedValue(row.selected_value_json)
     const leafKey = parts[parts.length - 1]
-    groups[groupId].fields[fieldId] = {
-      value,
-      field_name: fieldMap[rawPath] || fieldMap[fieldId] || leafKey,
-      source: row.source_document_id ? 'AI抽取' : null,
-      confidence: row.confidence,
-      document_id: row.source_document_id,
-      document_name: row.source_document_name,
-      document_type: row.source_document_type,
-      raw: row.source_text,
-      bbox: normalizeBbox(row.source_bbox_json),
-      page_idx: row.source_page,
-      source_id: row.candidate_id,
+    const fieldName = fieldMap[rawPath] || fieldMap[fieldId] || leafKey
+    const fieldPayload = buildFieldPayload(row, value, fieldName)
+    group.fields[fieldId] = fieldPayload
+
+    const hasRepeatableSection =
+      !!row.section_instance_id &&
+      typeof row.section_path === 'string' &&
+      !!row.section_path &&
+      Number(row.section_is_repeatable || 0) === 1
+    const hasRepeatableRow = !!row.row_instance_id && typeof row.group_path === 'string' && row.group_path
+    if (hasRepeatableSection || hasRepeatableRow) {
+      const recordIndex = Number(hasRepeatableRow ? row.row_repeat_index : row.section_repeat_index || 0)
+      const recordScope = hasRepeatableRow ? String(row.group_path) : String(row.section_path)
+      const recordKey = `${recordScope}#${Number.isFinite(recordIndex) ? recordIndex : 0}`
+      if (!repeatRecordMaps[groupId]) repeatRecordMaps[groupId] = new Map()
+      if (!repeatRecordMaps[groupId].has(recordKey)) {
+        repeatRecordMaps[groupId].set(recordKey, {
+          __repeat_index: Number.isFinite(recordIndex) ? recordIndex : 0,
+          __repeat_scope: recordScope,
+          fields: {},
+        })
+      }
+      const record = repeatRecordMaps[groupId].get(recordKey)
+      const scopedParts = hasRepeatableRow
+        ? parts.slice(String(row.group_path).split('/').filter(Boolean).length)
+        : parts.slice(String(row.section_path).split('/').filter(Boolean).length)
+      const scopedFieldId = scopedParts.length > 0 ? scopedParts.join('/') : fieldId
+      record.fields[scopedFieldId] = fieldPayload
+      record.fields[fieldId] = fieldPayload
+
+      if (recordScope && recordScope !== groupId) {
+        const scopedGroup = ensureProjectCrfGroup(groups, recordScope, fieldMap)
+        scopedGroup.is_repeatable = true
+        scopedGroup.fields[scopedFieldId] = fieldPayload
+        if (!repeatRecordMaps[recordScope]) repeatRecordMaps[recordScope] = new Map()
+        if (!repeatRecordMaps[recordScope].has(recordKey)) {
+          repeatRecordMaps[recordScope].set(recordKey, {
+            __repeat_index: Number.isFinite(recordIndex) ? recordIndex : 0,
+            __repeat_scope: recordScope,
+            fields: {},
+          })
+        }
+        const scopedGroupRecord = repeatRecordMaps[recordScope].get(recordKey)
+        scopedGroupRecord.fields[scopedFieldId] = fieldPayload
+      }
     }
     totalFields += 1
-    if (value !== null && value !== undefined && value !== '') {
+    if (isMeaningfulCrfValue(value)) {
       filledFields += 1
     }
+  }
+
+  for (const [groupId, recordMap] of Object.entries(repeatRecordMaps)) {
+    if (!groups[groupId]) continue
+    groups[groupId].is_repeatable = true
+    groups[groupId].records = [...recordMap.values()]
+      .sort((a, b) => Number(a.__repeat_index || 0) - Number(b.__repeat_index || 0))
   }
 
   const lastRun = db.prepare(`
@@ -256,6 +453,7 @@ function buildProjectCrfData(patientId: string, schemaId: string | null | undefi
 
   return {
     crfData: {
+      data: draftData,
       groups,
       _extracted_at: lastRun?.finished_at || null,
       _extraction_mode: 'full',
@@ -982,6 +1180,142 @@ router.get('/:projectId/patients/:patientId', (req: Request, res: Response) => {
 })
 
 /**
+ * PATCH /api/v1/projects/:projectId/patients/:patientId/crf/fields
+ * 保存项目 CRF 字段值（手动编辑结果）
+ * Body: { fields: [{ group_id, field_key, value }] }
+ */
+router.patch('/:projectId/patients/:patientId/crf/fields', (req: Request, res: Response) => {
+  try {
+    const projectId = paramId(req.params.projectId)
+    const patientId = paramId(req.params.patientId)
+    if (!projectId || !patientId) {
+      return res.status(400).json({ success: false, code: 400, message: '缺少 projectId 或 patientId', data: null })
+    }
+
+    const project = db.prepare(`SELECT id, schema_id FROM projects WHERE id = ?`).get(projectId) as any
+    if (!project) {
+      return res.status(404).json({ success: false, code: 404, message: '项目不存在', data: null })
+    }
+    if (!project.schema_id) {
+      return res.status(400).json({ success: false, code: 400, message: '项目未绑定 CRF 模板', data: null })
+    }
+
+    const enrollment = db.prepare(`
+      SELECT 1 FROM project_patients WHERE project_id = ? AND patient_id = ?
+    `).get(projectId, patientId) as any
+    if (!enrollment) {
+      return res.status(404).json({ success: false, code: 404, message: '患者未入组该项目', data: null })
+    }
+
+    const body = req.body
+    const fields = Array.isArray(body?.fields) ? body.fields : []
+    if (fields.length === 0) {
+      return res.json({ success: true, code: 0, message: '没有需要保存的字段', data: { changed_fields: 0 } })
+    }
+
+    // 查找或创建 project_crf schema_instance
+    let instance = db.prepare(`
+      SELECT id FROM schema_instances
+      WHERE patient_id = ? AND schema_id = ? AND instance_type = 'project_crf'
+      ORDER BY updated_at DESC LIMIT 1
+    `).get(patientId, project.schema_id) as { id: string } | undefined
+
+    let instanceId: string
+    if (!instance) {
+      instanceId = randomUUID()
+      db.prepare(`
+        INSERT INTO schema_instances (id, patient_id, schema_id, name, instance_type, status)
+        VALUES (?, ?, ?, ?, 'project_crf', 'draft')
+      `).run(instanceId, patientId, project.schema_id, `${project.schema_id} / ${patientId}`)
+    } else {
+      instanceId = instance.id
+    }
+
+    const upsertSelected = db.prepare(`
+      INSERT INTO field_value_selected
+        (id, instance_id, section_instance_id, row_instance_id, field_path,
+         selected_candidate_id, selected_value_json, selected_by)
+      VALUES (?, ?, NULL, NULL, ?, ?, ?, 'user')
+      ON CONFLICT(instance_id, COALESCE(section_instance_id, '__null__'), COALESCE(row_instance_id, '__null__'), field_path)
+      DO UPDATE SET
+        selected_candidate_id = excluded.selected_candidate_id,
+        selected_value_json  = excluded.selected_value_json,
+        selected_by          = 'user',
+        updated_at           = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+    `)
+
+    const insertCandidate = db.prepare(`
+      INSERT INTO field_value_candidates
+        (id, instance_id, field_path, value_json, value_type, source_text, confidence, created_by)
+      VALUES (?, ?, ?, ?, ?, ?, ?, 'user')
+    `)
+
+    const updatedAt = new Date().toISOString()
+    let changedCount = 0
+
+    const saveAll = db.transaction(() => {
+      for (const field of fields) {
+        const groupId = String(field?.group_id || '').trim()
+        const fieldKey = String(field?.field_key || '').trim()
+        if (!groupId || !fieldKey) continue
+
+        const fieldPath = `${groupId}/${fieldKey}`
+        const rawValue = field?.value
+        const valueJson = rawValue === null || rawValue === undefined
+          ? 'null'
+          : JSON.stringify(rawValue)
+        const valueType = Array.isArray(rawValue) ? 'array'
+          : typeof rawValue === 'number' ? 'number'
+          : typeof rawValue === 'object' ? 'object'
+          : 'string'
+
+        // 检查旧值是否相同
+        const existing = db.prepare(`
+          SELECT selected_value_json FROM field_value_selected
+          WHERE instance_id = ? AND field_path = ?
+        `).get(instanceId, fieldPath) as { selected_value_json: string } | undefined
+        if (existing && existing.selected_value_json === valueJson) {
+          continue
+        }
+
+        // 写入候选值
+        const candidateId = randomUUID()
+        insertCandidate.run(
+          candidateId,
+          instanceId,
+          fieldPath,
+          valueJson,
+          valueType,
+          '用户手动编辑',
+          null
+        )
+
+        // 写入选中值
+        upsertSelected.run(randomUUID(), instanceId, fieldPath, candidateId, valueJson)
+        changedCount++
+      }
+
+      // 更新时间戳
+      db.prepare(`
+        UPDATE schema_instances SET updated_at = ? WHERE id = ?
+      `).run(updatedAt, instanceId)
+    })
+
+    saveAll()
+
+    return res.json({
+      success: true,
+      code: 0,
+      message: '保存成功',
+      data: { changed_fields: changedCount, total_fields: fields.length },
+    })
+  } catch (err: any) {
+    console.error('[PATCH crf/fields]', err)
+    return res.status(500).json({ success: false, code: 500, message: err?.message || '服务器错误', data: null })
+  }
+})
+
+/**
  * GET /api/v1/projects/:projectId
  */
 router.get('/:projectId', (req: Request, res: Response) => {
@@ -1052,10 +1386,94 @@ router.get('/:projectId', (req: Request, res: Response) => {
 })
 
 /**
+ * GET /api/v1/projects/:projectId/template/designer
+ * 获取项目模板快照（designer + schema），供 ProjectTemplateDesigner 页面渲染。
+ * 快照存储于 schemas 表的 content_json（顶层 designer/schema 字段）。
+ */
+router.get('/:projectId/template/designer', (req: Request, res: Response) => {
+  try {
+    const projectId = paramId(req.params.projectId)
+    if (!projectId) {
+      return res.status(400).json({ success: false, code: 400, message: '缺少 projectId', data: null })
+    }
+    const proj = db.prepare(`SELECT id, schema_id FROM projects WHERE id = ?`).get(projectId) as { id: string; schema_id: string } | undefined
+    if (!proj) {
+      return res.status(404).json({ success: false, code: 404, message: '项目不存在', data: null })
+    }
+    if (!proj.schema_id) {
+      return res.status(400).json({ success: false, code: 400, message: '项目未关联 CRF 模板', data: null })
+    }
+    const schemaRow = db.prepare(`SELECT id, name, code, version, content_json FROM schemas WHERE id = ?`).get(proj.schema_id) as { id: string; name: string; code: string; version: string; content_json: string } | undefined
+    if (!schemaRow) {
+      return res.status(404).json({ success: false, code: 404, message: '关联的 CRF 模板不存在', data: null })
+    }
+    const content = parseJsonObject(schemaRow.content_json)
+    // content_json 可能直接就是 JSON Schema（顶层有 $schema/properties），
+    // 也可能包裹了 designer/schema 字段。统一处理：
+    const nestedDesigner = content.designer ?? null
+    const nestedSchema = content.schema ?? content.schema_json ?? null
+    return res.json({
+      success: true,
+      code: 0,
+      data: {
+        template_id: schemaRow.id,
+        template_name: schemaRow.name,
+        schema_version: schemaRow.version,
+        // 有嵌套结构时用嵌套值；否则 content_json 整体就是 schema
+        designer: nestedDesigner,
+        schema: nestedSchema ?? (Object.keys(content).length > 0 ? content : null),
+        schema_json: nestedSchema ?? (Object.keys(content).length > 0 ? content : null),
+      },
+    })
+  } catch (err: any) {
+    return res.status(500).json({ success: false, code: 500, message: err?.message, data: null })
+  }
+})
+
+/**
+ * PUT /api/v1/projects/:projectId/template/designer
+ * 保存项目模板快照（designer + schema），写入 schemas.content_json。
+ */
+router.put('/:projectId/template/designer', (req: Request, res: Response) => {
+  try {
+    const projectId = paramId(req.params.projectId)
+    if (!projectId) {
+      return res.status(400).json({ success: false, code: 400, message: '缺少 projectId', data: null })
+    }
+    const proj = db.prepare(`SELECT id, schema_id FROM projects WHERE id = ?`).get(projectId) as { id: string; schema_id: string } | undefined
+    if (!proj) {
+      return res.status(404).json({ success: false, code: 404, message: '项目不存在', data: null })
+    }
+    if (!proj.schema_id) {
+      return res.status(400).json({ success: false, code: 400, message: '项目未关联 CRF 模板', data: null })
+    }
+    const body = (req.body && typeof req.body === 'object' ? req.body : {}) as Record<string, unknown>
+    const designer = body.designer
+    const schema = body.schema ?? body.schema_json
+    const schemaRow = db.prepare(`SELECT content_json FROM schemas WHERE id = ?`).get(proj.schema_id) as { content_json: string } | undefined
+    if (!schemaRow) {
+      return res.status(404).json({ success: false, code: 404, message: '关联的 CRF 模板不存在', data: null })
+    }
+    const existing = parseJsonObject(schemaRow.content_json)
+    const updated = {
+      ...existing,
+      designer: designer !== undefined ? designer : existing.designer,
+      schema: schema !== undefined ? schema : existing.schema,
+      schema_json: schema !== undefined ? schema : existing.schema_json,
+    }
+    db.prepare(`UPDATE schemas SET content_json = ?, updated_at = ? WHERE id = ?`).run(JSON.stringify(updated), nowIso(), proj.schema_id)
+    return res.json({ success: true, code: 0, message: '保存成功', data: null })
+  } catch (err: any) {
+    return res.status(500).json({ success: false, code: 500, message: err?.message, data: null })
+  }
+})
+
+/**
  * POST /api/v1/projects/:projectId/crf/extraction
+ * POST /api/v1/projects/:projectId/crf/extraction/start  （前端别名）
  * 启动项目的 CRF 抽取任务
  */
-router.post('/:projectId/crf/extraction', async (req: Request, res: Response) => {
+async function handleCrfExtraction(req: Request, res: Response) {
   try {
     const projectId = paramId(req.params.projectId)
     if (!projectId) {
@@ -1121,11 +1539,15 @@ router.post('/:projectId/crf/extraction', async (req: Request, res: Response) =>
         continue
       }
 
+      // CRF batch 端点仅支持单个 target_section；取 targetGroups 第一个作为靶向抽取目标
+      const targetSection = targetGroups.length > 0 ? targetGroups[0] : null
+
       const response = await crfServiceSubmitBatch({
         patient_id: patientId,
         schema_id: proj.schema_id,
         document_ids: docIds,
         instance_type: 'project_crf',
+        target_section: targetSection,
       })
 
       if (!response.ok) {
@@ -1198,7 +1620,10 @@ router.post('/:projectId/crf/extraction', async (req: Request, res: Response) =>
     console.error('[POST /projects/:projectId/crf/extraction]', err)
     return res.status(500).json({ success: false, code: 500, message: err?.message || '服务器错误', data: null })
   }
-})
+}
+
+router.post('/:projectId/crf/extraction', handleCrfExtraction)
+router.post('/:projectId/crf/extraction/start', handleCrfExtraction)
 
 /**
  * GET /api/v1/projects/:projectId/crf/extraction/progress
@@ -1271,6 +1696,36 @@ router.get('/:projectId/crf/extraction/active', (req: Request, res: Response) =>
   } catch (err: any) {
      console.error('[GET /projects/:projectId/crf/extraction/active]', err)
      return res.status(500).json({ success: false, code: 500, message: err?.message, data: null })
+  }
+})
+
+/**
+ * GET /api/v1/projects/:projectId/crf/extraction/tasks
+ * 获取项目的历史抽取任务列表
+ */
+router.get('/:projectId/crf/extraction/tasks', (req: Request, res: Response) => {
+  try {
+    const projectId = paramId(req.params.projectId)
+    if (!projectId) {
+      return res.status(400).json({ success: false, code: 400, message: '缺少 projectId', data: null })
+    }
+    const proj = db.prepare(`SELECT id FROM projects WHERE id = ?`).get(projectId) as { id: string } | undefined
+    if (!proj) {
+      return res.status(404).json({ success: false, code: 404, message: '项目不存在', data: null })
+    }
+    const limit = Math.min(Math.max(parseInt(String(req.query.limit || '10'), 10), 1), 100)
+    const tasks = db.prepare(`
+      SELECT id, project_id, schema_id, status, mode, target_groups_json,
+             started_at, finished_at, cancelled_at, created_at, updated_at
+      FROM project_extraction_tasks
+      WHERE project_id = ?
+      ORDER BY created_at DESC
+      LIMIT ?
+    `).all(projectId, limit) as any[]
+
+    return res.json({ success: true, code: 0, data: { tasks } })
+  } catch (err: any) {
+    return res.status(500).json({ success: false, code: 500, message: err?.message, data: null })
   }
 })
 

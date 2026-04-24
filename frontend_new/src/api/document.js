@@ -298,6 +298,22 @@ export const extractEhrData = (documentId, options = {}) => {
 }
 
 /**
+ * 靶向抽取：针对指定字段组进行文档抽取
+ * @param {string} documentId - 文档ID
+ * @param {string} patientId - 患者ID
+ * @param {string} targetSection - 靶向字段组路径（如 "基本信息.人口学情况"）
+ * @returns {Promise} 抽取结果
+ */
+export const extractEhrDataTargeted = (documentId, patientId, targetSection) => {
+  return request.post(`/documents/${documentId}/extract-ehr`, {
+    patient_id: patientId,
+    target_section: targetSection,
+  }, {
+    timeout: 120000,
+  })
+}
+
+/**
  * 异步重新抽取文档元数据（执行 IndexerAgent，替换文档主表元数据）
  * 供「元数据字段」旁的「重新提取」使用，不执行病历结构化抽取
  * @param {string} documentId - 文档ID
@@ -996,6 +1012,7 @@ export default {
   getParseProgress,
   parseDocuments,
   extractEhrData,
+  extractEhrDataTargeted,
   extractDocumentMetadata,
   markDocumentReview,
   getDocumentOperationHistory,

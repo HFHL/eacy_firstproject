@@ -109,6 +109,8 @@ const ProjectDatasetView = () => {
   const [fieldGroupDetailVisible, setFieldGroupDetailVisible] = useState(false)
   const [currentFieldGroup, setCurrentFieldGroup] = useState(null)
   const [currentPatient, setCurrentPatient] = useState(null)
+  // 项目入组患者总数（用于患者统计，优于 expected_patient_count）
+  const [enrolledPatientCount, setEnrolledPatientCount] = useState(0)
   const [editProjectVisible, setEditProjectVisible] = useState(false)
   const [exportLoading, setExportLoading] = useState(false)
   const [exportForm] = Form.useForm()
@@ -244,6 +246,10 @@ const ProjectDatasetView = () => {
           pageSize: response.pagination.page_size,
           total: response.pagination.total
         })
+        // 更新入组患者总数（用于患者统计卡片）
+        if (typeof response.pagination.total === 'number') {
+          setEnrolledPatientCount(response.pagination.total)
+        }
       } else {
         message.error(response.message || '获取受试者列表失败')
       }
@@ -662,8 +668,8 @@ const ProjectDatasetView = () => {
     name: projectData.project_name,
     description: projectData.description,
     status: projectData.status,
-    totalPatients: projectData.expected_patient_count || 0,
-    extractedPatients: projectData.actual_patient_count || 0,
+    totalPatients: projectData.expected_patient_count || enrolledPatientCount || 0,
+    extractedPatients: enrolledPatientCount || 0,
     completeness: computedAvgCompleteness,
     crfTemplate: projectData?.template_info?.template_name
       || projectData?.template_scope_config?.template_name
@@ -3037,7 +3043,7 @@ const ProjectDatasetView = () => {
             <div>
               <div>任务ID: <Text code>{extractionProgress?.task_id || extractionTaskId || '-'}</Text></div>
               <div style={{ marginTop: 4 }}>
-                你也可以在浏览器 Network 里查看接口：<Text code>/projects/{projectId}/crf/extraction/progress/&lt;task_id&gt;</Text>
+                你也可以在浏览器 Network 里查看接口：<Text code>/projects/{projectId}/crf/extraction/progress?task_id=&lt;task_id&gt;</Text>
               </div>
             </div>
           }

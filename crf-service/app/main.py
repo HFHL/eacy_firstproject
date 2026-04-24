@@ -14,7 +14,8 @@ import asyncio
 import json
 import logging
 import uuid
-from typing import Any, Dict, List, Optional
+from contextlib import asynccontextmanager
+from typing import Any, AsyncIterator, Dict, List, Optional
 
 import redis
 from fastapi import FastAPI, HTTPException, Query
@@ -35,6 +36,51 @@ logging.basicConfig(
 )
 logger = logging.getLogger("crf-service")
 
+# ── Lifespan：启动时回收僵尸 running，关闭时不做额外清理 ─────────────────────
+
+@asynccontextmanager
+async def lifespan(app: FastAPI) -> AsyncIterator[None]:
+    """
+    启动钩子：扫描 `ehr_extraction_jobs` 里 status='running' 且 started_at 早于
+    `settings.EXTRACTION_STALE_MINUTES` 分钟的记录，判定为上次 worker 崩溃/被 kill
+    留下的僵尸，自动置为 cancelled，并回退关联 documents.extract_status。
+
+    这解决了 P14 的一个具体子问题：Celery worker 非正常退出后 running 状态不会自愈。
+    --reload 场景下每次热重载也会跑一次，幂等（阈值外的 running 不会被动）。
+    """
+    try:
+        repo = CRFRepo()
+        conn = repo.connect()
+        try:
+            summary = repo.sweep_stale_running_jobs(
+                conn, stale_minutes=settings.EXTRACTION_STALE_MINUTES
+            )
+            conn.commit()
+        finally:
+            conn.close()
+        if summary["cancelled_job_count"] > 0:
+            logger.warning(
+                "[startup] 回收僵尸 running 任务：cancel %d 个 job（阈值 %d 分钟，cutoff=%s），"
+                "回退 %d 个 document 状态",
+                summary["cancelled_job_count"],
+                settings.EXTRACTION_STALE_MINUTES,
+                summary["threshold_iso"],
+                summary["reverted_document_count"],
+            )
+            logger.info("[startup] cancelled job ids: %s", summary["cancelled_job_ids"])
+        else:
+            logger.info(
+                "[startup] 无僵尸 running 任务需要回收（阈值 %d 分钟）",
+                settings.EXTRACTION_STALE_MINUTES,
+            )
+    except Exception as exc:  # noqa: BLE001
+        # sweep 失败绝不阻断服务启动
+        logger.exception("[startup] 僵尸任务回收异常（忽略，不影响服务启动）: %s", exc)
+
+    yield
+    # 关闭阶段暂无清理逻辑
+
+
 # ── FastAPI App ──────────────────────────────────────────────────────────────
 
 app = FastAPI(
@@ -43,6 +89,7 @@ app = FastAPI(
     version="1.0.0",
     docs_url="/docs",
     redoc_url="/redoc",
+    lifespan=lifespan,
 )
 
 app.add_middleware(
@@ -217,7 +264,8 @@ async def extraction_progress_sse(job_id: str):
                 job = repo.get_job(conn, job_id)
             if job:
                 yield f"data: {json.dumps({'status': job.get('status', 'unknown'), 'node': 'init'}, ensure_ascii=False)}\n\n"
-                if job.get("status") in ("completed", "failed"):
+                # 终态立即结束，避免前端 EventSource 挂着空等 10 分钟才超时
+                if job.get("status") in ("completed", "failed", "cancelled"):
                     return
 
             # 监听 Redis pub/sub
@@ -231,7 +279,7 @@ async def extraction_progress_sse(job_id: str):
                     # 终止条件
                     try:
                         data = json.loads(message["data"])
-                        if data.get("status") in ("completed", "failed"):
+                        if data.get("status") in ("completed", "failed", "cancelled"):
                             break
                     except Exception:
                         pass

@@ -10,7 +10,7 @@ from __future__ import annotations
 import json
 import sqlite3
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
@@ -315,6 +315,114 @@ class CRFRepo:
             """,
             (error[:4000], _now_iso(), _now_iso(), job_id),
         )
+
+    # ─── 僵尸 running sweep ─────────────────────────────────────────────────
+    #
+    # 场景：Celery worker 被 SIGKILL / 进程崩溃 / 宿主断电时，正在跑的 job 没有
+    # 机会回写状态，DB 里留下 status='running' 的僵尸行。之后新任务提交时这些
+    # 僵尸不会自然恢复——只能靠定时 sweep 或下一次启动扫描清理。这里选择"启动
+    # 扫描"作为轻量兜底，判定阈值 = settings.EXTRACTION_STALE_MINUTES（默认 15 分钟）。
+    #
+    # 幂等、单事务；同时把关联 documents.extract_status 回退到 pending，
+    # materialize_status 同样处理（否则前端文档列表会永远停在 running 态）。
+    # 不触碰 documents.materialize_status = 'completed' 的行，避免回退成功物化的文档。
+    def sweep_stale_running_jobs(
+        self,
+        conn: sqlite3.Connection,
+        stale_minutes: int,
+        reason: str = "启动扫描：上次运行期间 worker 崩溃/被杀留下的僵尸 running",
+    ) -> Dict[str, Any]:
+        """
+        把 started_at 早于 now - stale_minutes 的 running jobs 置为 cancelled。
+
+        Returns:
+            {
+                "cancelled_job_ids": [...],
+                "cancelled_job_count": N,
+                "reverted_document_ids": [...],
+                "reverted_document_count": M,
+                "threshold_iso": "...",
+            }
+        """
+        cutoff_iso = (
+            datetime.now(timezone.utc) - timedelta(minutes=stale_minutes)
+        ).isoformat()
+
+        stale_rows = conn.execute(
+            """
+            SELECT id, document_id, started_at, patient_id
+            FROM ehr_extraction_jobs
+            WHERE status = 'running'
+              AND (started_at IS NULL OR started_at < ?)
+            """,
+            (cutoff_iso,),
+        ).fetchall()
+
+        if not stale_rows:
+            return {
+                "cancelled_job_ids": [],
+                "cancelled_job_count": 0,
+                "reverted_document_ids": [],
+                "reverted_document_count": 0,
+                "threshold_iso": cutoff_iso,
+            }
+
+        cancelled_ids = [row["id"] for row in stale_rows]
+        document_ids = [row["document_id"] for row in stale_rows if row["document_id"]]
+
+        now_iso = _now_iso()
+        placeholders = ",".join("?" for _ in cancelled_ids)
+        conn.execute(
+            f"""
+            UPDATE ehr_extraction_jobs
+            SET status       = 'cancelled',
+                completed_at = ?,
+                last_error   = COALESCE(last_error || ' | ', '') || ?,
+                updated_at   = ?
+            WHERE id IN ({placeholders})
+            """,
+            (now_iso, reason, now_iso, *cancelled_ids),
+        )
+
+        reverted_docs: List[str] = []
+        if document_ids:
+            doc_placeholders = ",".join("?" for _ in document_ids)
+            cur = conn.execute(
+                f"""
+                SELECT id FROM documents
+                WHERE id IN ({doc_placeholders})
+                  AND (extract_status = 'running' OR materialize_status = 'running')
+                """,
+                document_ids,
+            )
+            reverted_docs = [r["id"] for r in cur.fetchall()]
+
+            if reverted_docs:
+                rev_placeholders = ",".join("?" for _ in reverted_docs)
+                conn.execute(
+                    f"""
+                    UPDATE documents
+                    SET extract_status = CASE
+                            WHEN extract_status = 'running' THEN 'pending'
+                            ELSE extract_status
+                         END,
+                        materialize_status = CASE
+                            WHEN materialize_status = 'running' THEN 'pending'
+                            ELSE materialize_status
+                         END,
+                        updated_at = ?
+                    WHERE id IN ({rev_placeholders})
+                    """,
+                    (now_iso, *reverted_docs),
+                )
+
+        return {
+            "cancelled_job_ids": cancelled_ids,
+            "cancelled_job_count": len(cancelled_ids),
+            "reverted_document_ids": reverted_docs,
+            "reverted_document_count": len(reverted_docs),
+            "threshold_iso": cutoff_iso,
+        }
 
     # ─── 物化层写入 ────────────────────────────────────────────────────────
 

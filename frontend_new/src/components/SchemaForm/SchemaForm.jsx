@@ -38,18 +38,18 @@ import {
   ClockCircleOutlined,
   UserOutlined,
   EditOutlined,
-  UploadOutlined,
   ZoomInOutlined,
   ZoomOutOutlined,
   RotateRightOutlined,
   ReloadOutlined,
   DatabaseOutlined,
-  DragOutlined
+  DragOutlined,
+  UploadOutlined
 } from '@ant-design/icons'
 import { SchemaFormProvider, useSchemaForm } from './SchemaFormContext'
 import CategoryTree from './CategoryTree'
 import FormPanel from './FormPanel'
-import { getDocumentDetail, getDocumentTempUrl, getDocumentPdfStreamUrl } from '../../api/document'
+import { getDocumentDetail, getDocumentTempUrl, getDocumentPdfStreamUrl, extractEhrDataTargeted, uploadAndArchiveAsync } from '../../api/document'
 import { getEhrFieldHistoryV3, getEhrFieldCandidatesV3, selectEhrFieldCandidateV3 } from '../../api/patient'
 import PdfPageWithHighlight from '../PdfPageWithHighlight'
 import { getProjectCrfFieldHistory, getProjectCrfFieldCandidates, selectProjectCrfFieldCandidate } from '../../api/project'
@@ -116,33 +116,47 @@ const Toolbar = ({ onSave, onReset, saving, autoSaveEnabled, onToggleAutoSave })
   )
 }
 
-/** 从 8 点 position [x1,y1,x2,y2,x3,y3,x4,y4] 得到包围矩形 [minX, minY, maxX, maxY]（0–1000 归一化）。
- * 若提供 pageWidth、pageHeight，按页面宽高分别归一化，避免框偏移；
- * 否则若坐标明显为像素（max > 1000），则用单一比例缩放到 0–1000。 */
+/** 从 8 点 position [x1,y1,x2,y2,x3,y3,x4,y4] 得到包围矩形。
+ *
+ * 新版 OCR（/parse）：position 为 [0,1] 归一化坐标，pageWidth/pageHeight 为原图像素尺寸。
+ *   → 将 [0,1] 坐标还原为原图像素坐标（如 x1=0.11, pageWidth=4344 → 0.11*4344=478px），
+ *     返回 [478, 786, 4145, 4938] 形式的原图像素坐标。
+ *
+ * 旧版 OCR（/pdf_to_markdown）：position 为原图像素坐标，无 pageWidth/pageHeight。
+ *   → 若坐标明显为像素（max > 1000），直接返回；
+ *     若坐标在 0-1000 范围（已归一化），直接返回。
+ */
 function _positionToBbox(position, pageWidth, pageHeight) {
   if (!Array.isArray(position) || position.length < 8) return null
   const xs = [position[0], position[2], position[4], position[6]]
   const ys = [position[1], position[3], position[5], position[7]]
-  let minX = Math.min(...xs)
-  let minY = Math.min(...ys)
-  let maxX = Math.max(...xs)
-  let maxY = Math.max(...ys)
-  const hasPageSize = typeof pageWidth === 'number' && pageWidth > 0 && typeof pageHeight === 'number' && pageHeight > 0
-  if (hasPageSize) {
-    minX = (minX / pageWidth) * 1000
-    minY = (minY / pageHeight) * 1000
-    maxX = (maxX / pageWidth) * 1000
-    maxY = (maxY / pageHeight) * 1000
-  } else {
-    const maxCoord = Math.max(maxX, maxY)
-    if (maxCoord > 1000 && maxCoord > 0) {
-      const scale = 1000 / maxCoord
-      minX *= scale
-      minY *= scale
-      maxX *= scale
-      maxY *= scale
-    }
+  const minX = Math.min(...xs)
+  const minY = Math.min(...ys)
+  const maxX = Math.max(...xs)
+  const maxY = Math.max(...ys)
+
+  // 新版 OCR：检测 position 是否为 [0,1] 归一化坐标（所有值 ≤ 1）
+  const allIn01 = xs.every((x) => x >= 0 && x <= 1) && ys.every((y) => y >= 0 && y <= 1)
+  const hasPageSize = typeof pageWidth === 'number' && pageWidth > 0 &&
+                      typeof pageHeight === 'number' && pageHeight > 0
+
+  if (allIn01 && hasPageSize) {
+    // [0,1] 归一化坐标 → 还原为原图像素坐标
+    return [
+      Math.round(minX * pageWidth),
+      Math.round(minY * pageHeight),
+      Math.round(maxX * pageWidth),
+      Math.round(maxY * pageHeight),
+    ]
   }
+
+  // 旧版 OCR：像素坐标（max > 1000）或无 pageSize
+  const maxCoord = Math.max(maxX, maxY)
+  if (maxCoord > 1000) {
+    // 已经是像素坐标，直接返回
+    return [minX, minY, maxX, maxY]
+  }
+  // 已归一化到 0-1000，直接返回
   return [minX, minY, maxX, maxY]
 }
 
@@ -150,22 +164,25 @@ function _positionToBbox(position, pageWidth, pageHeight) {
  * 优先使用 content_list 的 position（8 点），无则使用 bbox（4 点）。
  *
  * 坐标单位说明：
- *   - 0~1000 归一化：pageWidth/pageHeight = 1000
- *   - 原图像素（> 1100）：pageWidth/pageHeight = null，由渲染侧按
- *     图片 naturalWidth/naturalHeight 换算。
+ *   - 新版 Textin 像素坐标：保留 pageWidth/pageHeight，由渲染侧精确等比换算。
+ *   - 0~1000 归一化：pageWidth/pageHeight = 1000。
+ *   - 旧版原图像素且无页面尺寸：pageWidth/pageHeight = null，由图片 naturalWidth/naturalHeight 换算。
  */
 function _sourceLocationToCoordinates(loc) {
   if (!loc) return null
 
   const toCoord = (item) => {
     if (!item || typeof item !== 'object') return null
+    const rawPageWidth = Number(item.page_width || 0)
+    const rawPageHeight = Number(item.page_height || 0)
+    const hasTextinPageSize = rawPageWidth > 0 && rawPageHeight > 0
     // 优先使用 position（8 点），再回退到 bbox（4 点）
     let bbox = item.bbox
     if ((!bbox || bbox.length < 4) && Array.isArray(item.position) && item.position.length >= 8) {
       bbox = _positionToBbox(
         item.position,
-        item.page_width,
-        item.page_height
+        rawPageWidth,
+        rawPageHeight
       )
     }
     if (!Array.isArray(bbox) || bbox.length < 4) return null
@@ -176,13 +193,14 @@ function _sourceLocationToCoordinates(loc) {
       Math.abs(x1), Math.abs(y1), Math.abs(x2), Math.abs(y2)
     )
     const isPixel = maxV > 1100
+    console.debug('[_sourceLocationToCoordinates]', { bbox: [x1,y1,x2,y2], maxV, isPixel, page })
     return {
       x: x1,
       y: y1,
       width: x2 - x1,
       height: y2 - y1,
-      pageWidth: isPixel ? null : 1000,
-      pageHeight: isPixel ? null : 1000,
+      pageWidth: hasTextinPageSize ? rawPageWidth : (isPixel ? null : 1000),
+      pageHeight: hasTextinPageSize ? rawPageHeight : (isPixel ? null : 1000),
       pageIdx: Math.max(0, page - 1)
     }
   }
@@ -274,6 +292,7 @@ const ModificationHistory = ({
   const [fieldMeta, setFieldMeta] = useState({
     candidates: [],
     selectedCandidateId: null,
+    selectedValue: null,   // 当前选中值（用于审计记录的回退匹配）
     hasValueConflict: false,
     distinctValueCount: 0,
   })
@@ -314,6 +333,7 @@ const ModificationHistory = ({
             setFieldMeta({
               candidates: Array.isArray(candidatePayload?.candidates) ? candidatePayload.candidates : [],
               selectedCandidateId: candidatePayload?.selected_candidate_id || null,
+              selectedValue: candidatePayload?.selected_value ?? null,
               hasValueConflict: !!candidatePayload?.has_value_conflict,
               distinctValueCount: Number(candidatePayload?.distinct_value_count || 0),
             })
@@ -348,6 +368,7 @@ const ModificationHistory = ({
             setFieldMeta({
               candidates: Array.isArray(candidatePayload?.candidates) ? candidatePayload.candidates : [],
               selectedCandidateId: candidatePayload?.selected_candidate_id || null,
+              selectedValue: candidatePayload?.selected_value ?? null,
               hasValueConflict: !!candidatePayload?.has_value_conflict,
               distinctValueCount: Number(candidatePayload?.distinct_value_count || 0),
             })
@@ -420,6 +441,8 @@ const ModificationHistory = ({
     if (arrayIdx === null) return true
     const sub = extractSubFieldValues(item)
     if (!sub) return true
+    const canCompareSubField = sub.oldSub !== undefined || sub.newSub !== undefined
+    if (!canCompareSubField) return true
     return formatValue(sub.oldSub) !== formatValue(sub.newSub)
   }), [history, arrayIdx, subFieldPath, fieldPath, isSensitive])
   
@@ -454,9 +477,9 @@ const ModificationHistory = ({
       const selectedCandidate = (fieldMeta.candidates || []).find((item) => item?.id === candidateId)
       const selectedValue = getCandidateDisplayValue(selectedCandidate)
       if (projectId && patientId) {
-        await selectProjectCrfFieldCandidate(projectId, patientId, queryPath, candidateId, undefined, rowUid)
+        await selectProjectCrfFieldCandidate(projectId, patientId, queryPath, candidateId, selectedValue, rowUid)
       } else if (patientId) {
-        await selectEhrFieldCandidateV3(patientId, queryPath, candidateId, undefined, rowUid)
+        await selectEhrFieldCandidateV3(patientId, queryPath, candidateId, selectedValue, rowUid)
       }
       if (typeof onCandidateApplied === 'function' && selectedCandidate) {
         onCandidateApplied(queryPath, selectedValue, rowUid)
@@ -566,40 +589,53 @@ const ModificationHistory = ({
             )}
           </div>
           <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
-            {fieldMeta.candidates.map((candidate) => {
-              const candidateId = candidate?.id
-              const isSelected = candidateId && candidateId === fieldMeta.selectedCandidateId
-              return (
-                <div
-                  key={candidateId}
-                  style={{
-                    border: `1px solid ${isSelected ? appThemeToken.colorPrimary : appThemeToken.colorBorder}`,
-                    borderRadius: 6,
-                    padding: 8,
-                    background: isSelected ? appThemeToken.colorPrimaryBg : appThemeToken.colorBgContainer,
-                  }}
-                >
-                  <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 8 }}>
-                    <Text style={{ fontSize: 12, fontWeight: 500 }}>{formatValue(getCandidateDisplayValue(candidate))}</Text>
-                    <Button
-                      type={isSelected ? 'default' : 'primary'}
-                      size="small"
-                      disabled={isSelected}
-                      loading={selectingCandidateId === candidateId}
-                      onClick={() => handleSelectCandidate(candidateId)}
-                    >
-                      {isSelected ? '当前值' : '采用此值'}
-                    </Button>
+            {(() => {
+              const candidates = fieldMeta.candidates || []
+              const selectedCandidateId = fieldMeta.selectedCandidateId
+              const hasSelectedIdInList = selectedCandidateId && candidates.some((item) => item?.id === selectedCandidateId)
+              const selectedValueKey = fieldMeta.selectedValue != null ? JSON.stringify(fieldMeta.selectedValue) : null
+              const fallbackSelectedCandidateId = !hasSelectedIdInList && selectedValueKey
+                ? candidates.find((item) => JSON.stringify(item?.value) === selectedValueKey)?.id
+                : null
+
+              return candidates.map((candidate) => {
+                const candidateId = candidate?.id
+                const isSelected = !!candidateId && (
+                  candidateId === selectedCandidateId ||
+                  candidateId === fallbackSelectedCandidateId
+                )
+                return (
+                  <div
+                    key={candidateId}
+                    style={{
+                      border: `1px solid ${isSelected ? appThemeToken.colorPrimary : appThemeToken.colorBorder}`,
+                      borderRadius: 6,
+                      padding: 8,
+                      background: isSelected ? appThemeToken.colorPrimaryBg : appThemeToken.colorBgContainer,
+                    }}
+                  >
+                    <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 8 }}>
+                      <Text style={{ fontSize: 12, fontWeight: 500 }}>{formatValue(getCandidateDisplayValue(candidate))}</Text>
+                      <Button
+                        type={isSelected ? 'default' : 'primary'}
+                        size="small"
+                        disabled={isSelected}
+                        loading={selectingCandidateId === candidateId}
+                        onClick={() => handleSelectCandidate(candidateId)}
+                      >
+                        {isSelected ? '当前值' : '采用此值'}
+                      </Button>
+                    </div>
+                    <div style={{ marginTop: 6, fontSize: 12, color: appThemeToken.colorTextSecondary }}>
+                      <div>来源文档: {candidate?.source_document_id || '—'}</div>
+                      <div>页码: {candidate?.source_page ?? '—'}</div>
+                      {candidate?.source_text ? <div>原文片段: {candidate.source_text}</div> : null}
+                      {candidate?.confidence != null ? <div>置信度: {candidate.confidence}</div> : null}
+                    </div>
                   </div>
-                  <div style={{ marginTop: 6, fontSize: 12, color: appThemeToken.colorTextSecondary }}>
-                    <div>来源文档: {candidate?.source_document_id || '—'}</div>
-                    <div>页码: {candidate?.source_page ?? '—'}</div>
-                    {candidate?.source_text ? <div>原文片段: {candidate.source_text}</div> : null}
-                    {candidate?.confidence != null ? <div>置信度: {candidate.confidence}</div> : null}
-                  </div>
-                </div>
-              )
-            })}
+                )
+              })
+            })()}
           </div>
         </div>
       )}
@@ -657,6 +693,8 @@ const SourceDocumentPreview = ({ documentInfo, activeCoordinates, panelWidth = 4
     ? coordsList.map((c) => ({
         page: (c.pageIdx != null ? c.pageIdx : 0) + 1,
         bbox: [c.x, c.y, c.x + (c.width || 0), c.y + (c.height || 0)],
+        page_width: c.pageWidth || null,
+        page_height: c.pageHeight || null,
       }))
     : []
 
@@ -893,7 +931,7 @@ const SourcePanel = ({
   const [docModalDoc, setDocModalDoc] = useState(null)
   // 从修改历史中选中的一条记录，用于展示该条对应的文档预览与 bbox（有 source_document_id 即可溯源）
   const [selectedHistoryItem, setSelectedHistoryItem] = useState(null)
-  // 标记当前是否处于“自动选中首条 revoke 记录但不触发溯源请求”的抑制状态；
+  // 标记当前是否处于"自动选中首条 revoke 记录但不触发溯源请求"的抑制状态；
   // 一旦用户主动点击「查看溯源」，即关闭抑制，允许对该记录发起文档请求。
   const [suppressAutoSourceDoc, setSuppressAutoSourceDoc] = useState(false)
 
@@ -979,12 +1017,12 @@ const SourcePanel = ({
   // 计算当前有效面板宽度（固定模式用 width prop，浮动模式用 floatingWidth）
   const effectivePanelWidth = isPinned ? width : floatingWidth
 
-  // 切换字段或患者时清空“从修改历史选中的记录”，避免预览错位
+  // 切换字段或患者时清空"从修改历史选中的记录"，避免预览错位
   useEffect(() => {
     setSelectedHistoryItem(null)
   }, [selectedField?.path, patientId])
 
-  // 有 patientId 时：默认展示与字段摘要均由修改历史决定；默认选“第一条”历史记录
+  // 有 patientId 时：默认展示与字段摘要均由修改历史决定；默认选"第一条"历史记录
   const handleHistoryLoaded = useCallback((historyList) => {
     if (!Array.isArray(historyList) || !patientId) return
     const firstItem = historyList[0] || null
@@ -1064,7 +1102,7 @@ const SourcePanel = ({
     const r = String(rule || '').trim().toLowerCase()
     if (!content || !r) return false
     if (content.includes(r)) return true
-    // 兼容“出院小结/记录”这类组合来源名：拆分后任一片段命中即可
+    // 兼容"出院小结/记录"这类组合来源名：拆分后任一片段命中即可
     const tokens = r
       .split(/[\/、,，\s]+/)
       .map(t => t.trim())
@@ -1265,7 +1303,7 @@ const SourcePanel = ({
               overflow: 'hidden',
               zIndex: 1,
             }
-          // 其他场景保持原有“占满父容器高度”的固定布局
+          // 其他场景保持原有"占满父容器高度"的固定布局
           : {
               width,
               height: '100%',
@@ -1515,7 +1553,7 @@ const DIVIDER_LINE_STYLE = {
   pointerEvents: 'none',
   zIndex: 4
 }
-const SchemaFormInner = ({ onSave, onReset, onFieldCandidateSolidified, externalHistoryRefreshKey = 0, autoSaveInterval = 30000, siderWidth = 220, sourcePanelWidth, collapsible = true, showSourcePanel = true, projectMode = false, projectConfig = null, projectId = null, patientId = null, contentAdaptive = false, leftHeader = null, collapsedTitle = '目录', onToolbarUploadDocument = null, beforeUploadActions = null }) => {
+const SchemaFormInner = ({ onSave, onReset, onFieldCandidateSolidified, externalHistoryRefreshKey = 0, autoSaveInterval = 30000, siderWidth = 220, sourcePanelWidth, collapsible = true, showSourcePanel = true, projectMode = false, projectConfig = null, projectId = null, patientId = null, contentAdaptive = false, leftHeader = null, collapsedTitle = '目录', beforeUploadActions = null }) => {
   const { state, actions, draftData, patientData, isDirty } = useSchemaForm()
   const [leftCollapsed, setLeftCollapsed] = useState(false)
   const [rightCollapsed, setRightCollapsed] = useState(true)
@@ -1548,10 +1586,11 @@ const SchemaFormInner = ({ onSave, onReset, onFieldCandidateSolidified, external
   const rightPanelLastWidthRef = useRef(rightPanelWidth)
   const leftPanelLastWidthRef = useRef(leftPanelWidth)
   const leftPanelResizeStart = useRef({ x: 0, w: 0 })
-  const [extractModalOpen, setExtractModalOpen] = useState(false)
-  const [extractMode, setExtractMode] = useState('existing')
   const [selectedExtractDocId, setSelectedExtractDocId] = useState(null)
-  const [selectedUploadFile, setSelectedUploadFile] = useState(null)
+  const [extractConfirming, setExtractConfirming] = useState(false)
+  const [uploadExtractModalOpen, setUploadExtractModalOpen] = useState(false)
+  const [uploadExtractTab, setUploadExtractTab] = useState('existing') // 'existing' | 'upload'
+  const uploadFileInputRef = useRef(null)
   const [isLeftPanelResizing, setIsLeftPanelResizing] = useState(false)
   const [isRightPanelResizing, setIsRightPanelResizing] = useState(false)
   const mergedHistoryRefreshKey = historyRefreshKey + Number(externalHistoryRefreshKey || 0)
@@ -1603,10 +1642,11 @@ const SchemaFormInner = ({ onSave, onReset, onFieldCandidateSolidified, external
     document.addEventListener('mouseup', onMouseUp)
   }, [rightPanelWidth])
   const { documents: projectDocuments = [], selectedDocument = null, onDocumentSelect, onUploadDocument, onAddRepeatableInstance, repeatableNamingPattern = '{formName}_{index}' } = projectConfig || {}
+  // CRF 服务 _parse_form_path 用 " / " 分隔路径（如 "治疗情况 / 手术治疗"）
   const targetSection = useMemo(() => {
     if (!state?.selectedPath) return null
     const parts = state.selectedPath.split('.')
-    return parts.slice(0, Math.min(parts.length, 2)).join('.')
+    return parts.slice(0, Math.min(parts.length, 2)).join(' / ')
   }, [state?.selectedPath])
   const extractCandidateDocuments = useMemo(
     () => buildCandidateDocuments(draftData, projectDocuments),
@@ -1616,19 +1656,14 @@ const SchemaFormInner = ({ onSave, onReset, onFieldCandidateSolidified, external
     () => extractCandidateDocuments.find((doc) => String(doc?.id) === String(selectedExtractDocId)) || null,
     [extractCandidateDocuments, selectedExtractDocId]
   )
-  const handleOpenExtractModal = useCallback(() => {
-    setExtractMode(extractCandidateDocuments.length > 0 ? 'existing' : 'upload')
-    setExtractModalOpen(true)
-  }, [extractCandidateDocuments.length])
-  const handleCloseExtractModal = useCallback(() => {
-    setExtractModalOpen(false)
-    setSelectedUploadFile(null)
+  const handleOpenUploadExtractModal = useCallback((tab = 'existing') => {
+    setUploadExtractTab(tab)
+    setUploadExtractModalOpen(true)
   }, [])
-  const handlePickUploadFile = useCallback((file) => {
-    setSelectedUploadFile(file)
-    return false
+  const handleCloseUploadExtractModal = useCallback(() => {
+    setUploadExtractModalOpen(false)
   }, [])
-  const handleConfirmExtract = useCallback(() => {
+  const handleConfirmExtract = useCallback(async () => {
     if (!patientId) {
       message.warning('缺少患者信息，暂无法执行文档抽取')
       return
@@ -1637,38 +1672,99 @@ const SchemaFormInner = ({ onSave, onReset, onFieldCandidateSolidified, external
       message.warning('请先在左侧选择目标字段组')
       return
     }
-    if (extractMode === 'existing') {
-      if (!selectedExtractDocument) {
-        message.warning('请先选择一个现有文档')
+    if (!selectedExtractDocument) {
+      message.warning('请先选择一个现有文档')
+      return
+    }
+    setExtractConfirming(true)
+    try {
+      const response = await extractEhrDataTargeted(
+        String(selectedExtractDocument.id),
+        patientId,
+        targetSection
+      )
+      if (response.success) {
+        message.success('文档抽取任务已提交，请稍候...')
+        setUploadExtractModalOpen(false)
+        onDataChange && onDataChange(draftData)
+      } else {
+        message.error(response.message || '抽取失败')
+      }
+    } catch (err) {
+      message.error('抽取失败: ' + (err.message || '未知错误'))
+    } finally {
+      setExtractConfirming(false)
+    }
+  }, [patientId, targetSection, selectedExtractDocument])
+  const handleUploadExtractFile = useCallback(async (e) => {
+    const file = e.target.files?.[0]
+    if (!file) return
+    e.target.value = '' // reset input so same file can be re-selected
+
+    const supportedTypes = ['application/pdf', 'image/jpg', 'image/jpeg', 'image/png']
+    if (!supportedTypes.includes(file.type)) {
+      message.error('不支持的文件格式，请上传 PDF、JPG、JPEG 或 PNG 文件')
+      return
+    }
+    if (file.size > 50 * 1024 * 1024) {
+      message.error('文件超过 50MB 限制')
+      return
+    }
+    if (!patientId) {
+      message.error('缺少患者信息，无法上传')
+      return
+    }
+    if (!targetSection) {
+      message.error('请先在左侧目录中选择目标字段组，再进行文档抽取')
+      return
+    }
+
+    message.loading({ content: '正在上传文件并触发 OCR 流水线...', key: 'uploadExtract' })
+      const uploadResult = await uploadAndArchiveAsync(file, patientId, {
+        targetSection,
+        autoMergeEhr: true,
+        parserType: 'textin',
+      })
+      if (!uploadResult?.success) {
+        message.error({ content: uploadResult?.message || '文件上传失败', key: 'uploadExtract' })
         return
       }
-      message.info(`前端占位：已选择文档「${getDocumentDisplayName(selectedExtractDocument)}」，字段组「${targetSection}」，待后端抽取接口接入。`)
-      setExtractModalOpen(false)
-      return
-    }
-    if (!selectedUploadFile) {
-      message.warning('请先选择要上传的文档')
-      return
-    }
-    message.info(`前端占位：将上传「${selectedUploadFile.name}」并绑定患者 ${patientId}，字段组「${targetSection}」，待后端抽取链路接入。`)
-    setExtractModalOpen(false)
-    setSelectedUploadFile(null)
-  }, [extractMode, patientId, targetSection, selectedExtractDocument, selectedUploadFile])
-  const documentExtractToolbarAction = (
-    <Button
-      size="small"
-      icon={<DatabaseOutlined />}
-      onClick={handleOpenExtractModal}
-      style={{
-        ...HEADER_ICON_BUTTON_STYLE,
-        width: 'auto',
-        minWidth: 72,
-        padding: '0 8px'
-      }}
-    >
-      文档抽取
-    </Button>
-  )
+      const docId = uploadResult.data?.document_id || uploadResult.data?.id
+      if (!docId) {
+        message.error({ content: '上传响应中缺少文档 ID', key: 'uploadExtract' })
+        return
+      }
+      // 轮询 OCR 完成状态（最多 60s），再触发 EHR 抽取
+      message.loading({ content: '等待 OCR 解析完成...', key: 'uploadExtract' })
+      let ocrDone = false
+      for (let i = 0; i < 30; i++) {
+        await new Promise(r => setTimeout(r, 2000))
+        try {
+          const detail = await getDocumentDetail(docId)
+          const doc = detail?.data
+          if (
+            doc &&
+            (doc.status === 'ocr_succeeded' || doc.status === 'archived' || doc.raw_text || doc.ocr_payload)
+          ) {
+            ocrDone = true
+            break
+          }
+        } catch (_) { /* 继续轮询 */ }
+      }
+      if (!ocrDone) {
+        message.error({ content: 'OCR 解析超时，请稍后重试', key: 'uploadExtract' })
+        return
+      }
+      message.loading({ content: '上传成功，正在提交抽取任务...', key: 'uploadExtract' })
+      const extractResult = await extractEhrDataTargeted(String(docId), patientId, targetSection)
+      if (extractResult.success) {
+        message.success({ content: '文件上传成功，抽取任务已提交，请稍候...', key: 'uploadExtract' })
+        setUploadExtractModalOpen(false)
+        onDataChange && onDataChange(draftData)
+      } else {
+        message.error({ content: extractResult.message || '抽取任务提交失败', key: 'uploadExtract' })
+      }
+  }, [patientId, targetSection])
   const handleSave = useCallback(async (type = 'manual') => {
     if (!isDirty && type === 'manual') { message.info('没有需要保存的修改'); return }
     setSaving(true)
@@ -1889,12 +1985,9 @@ const SchemaFormInner = ({ onSave, onReset, onFieldCandidateSolidified, external
       </Modal>
       <Modal
         title="文档抽取"
-        open={extractModalOpen}
-        onCancel={handleCloseExtractModal}
-        onOk={handleConfirmExtract}
-        okText="确认抽取"
-        cancelText="取消"
-        okButtonProps={{ disabled: !patientId || !targetSection || (extractMode === 'existing' ? !selectedExtractDocument : !selectedUploadFile) }}
+        open={uploadExtractModalOpen}
+        onCancel={handleCloseUploadExtractModal}
+        footer={null}
         width={720}
       >
         <div style={{ marginBottom: 12, display: 'flex', gap: 8, alignItems: 'center', flexWrap: 'wrap' }}>
@@ -1903,78 +1996,101 @@ const SchemaFormInner = ({ onSave, onReset, onFieldCandidateSolidified, external
           <Text type="secondary">患者ID：{patientId || '-'}</Text>
           {projectId && <Text type="secondary">项目ID：{projectId}</Text>}
         </div>
-        {!targetSection && (
-          <div style={{ marginBottom: 12, padding: '8px 12px', borderRadius: 6, background: '#fffbe6', border: '1px solid #ffe58f', color: '#ad6800' }}>
-            请先在左侧目录中选择目标表单，再进行文档抽取。
-          </div>
-        )}
         <Tabs
-          activeKey={extractMode}
-          onChange={(key) => setExtractMode(key)}
+          activeKey={uploadExtractTab}
+          onChange={(key) => {
+            setUploadExtractTab(key)
+            if (key === 'upload') {
+              // Trigger file input click for upload tab
+              uploadFileInputRef.current?.click()
+            }
+          }}
           items={[
             {
               key: 'existing',
-              label: '选择现有文档',
+              label: '从现有文档抽取',
               children: (
-                <div className="schema-form-scrollable hover-scrollbar" style={{ maxHeight: 300, overflowY: 'auto', border: '1px solid #f0f0f0', borderRadius: 8 }}>
+                <>
+                  {!targetSection && (
+                    <div style={{ marginBottom: 12, padding: '8px 12px', borderRadius: 6, background: '#fffbe6', border: '1px solid #ffe58f', color: '#ad6800' }}>
+                      请先在左侧目录中选择目标表单，再进行文档抽取。
+                    </div>
+                  )}
                   {extractCandidateDocuments.length === 0 ? (
                     <Empty
                       image={Empty.PRESENTED_IMAGE_SIMPLE}
-                      description="暂无可选文档，请切换到“上传文档”"
+                      description="该患者暂无关联文档"
                       style={{ margin: '28px 0' }}
                     />
                   ) : (
-                    extractCandidateDocuments.map((doc) => {
-                      const docId = String(doc?.id ?? '')
-                      const active = String(selectedExtractDocId) === docId
-                      return (
-                        <button
-                          key={docId || `${getDocumentDisplayName(doc)}_${formatDocumentUploadedAt(doc)}`}
-                          type="button"
-                          onClick={() => setSelectedExtractDocId(docId)}
-                          style={{
-                            width: '100%',
-                            textAlign: 'left',
-                            border: 'none',
-                            borderBottom: '1px solid #f5f5f5',
-                            background: active ? '#e6f7ff' : '#fff',
-                            padding: '10px 12px',
-                            cursor: 'pointer'
-                          }}
-                        >
-                          <div style={{ display: 'flex', justifyContent: 'space-between', gap: 10 }}>
-                            <Text strong style={{ color: active ? '#1677ff' : '#1f1f1f' }}>{getDocumentDisplayName(doc)}</Text>
-                            <Text type="secondary" style={{ whiteSpace: 'nowrap' }}>{formatDocumentUploadedAt(doc)}</Text>
-                          </div>
-                          <Text type="secondary" style={{ fontSize: 12 }}>{getDocumentTypeLabel(doc)}</Text>
-                        </button>
-                      )
-                    })
+                    <div className="schema-form-scrollable hover-scrollbar" style={{ maxHeight: 300, overflowY: 'auto', border: '1px solid #f0f0f0', borderRadius: 8 }}>
+                      {extractCandidateDocuments.map((doc) => {
+                        const docId = String(doc?.id ?? '')
+                        const active = String(selectedExtractDocId) === docId
+                        return (
+                          <button
+                            key={docId || `${getDocumentDisplayName(doc)}_${formatDocumentUploadedAt(doc)}`}
+                            type="button"
+                            onClick={() => setSelectedExtractDocId(docId)}
+                            style={{
+                              width: '100%',
+                              textAlign: 'left',
+                              border: 'none',
+                              borderBottom: '1px solid #f5f5f5',
+                              background: active ? '#e6f7ff' : '#fff',
+                              padding: '10px 12px',
+                              cursor: 'pointer'
+                            }}
+                          >
+                            <div style={{ display: 'flex', justifyContent: 'space-between', gap: 10 }}>
+                              <Text strong style={{ color: active ? '#1677ff' : '#1f1f1f' }}>{getDocumentDisplayName(doc)}</Text>
+                              <Text type="secondary" style={{ whiteSpace: 'nowrap' }}>{formatDocumentUploadedAt(doc)}</Text>
+                            </div>
+                            <Text type="secondary" style={{ fontSize: 12 }}>{getDocumentTypeLabel(doc)}</Text>
+                          </button>
+                        )
+                      })}
+                    </div>
                   )}
-                </div>
+                  <div style={{ marginTop: 12, display: 'flex', justifyContent: 'flex-end' }}>
+                    <Button
+                      type="primary"
+                      disabled={extractConfirming || !patientId || !targetSection || !selectedExtractDocument}
+                      loading={extractConfirming}
+                      onClick={handleConfirmExtract}
+                    >
+                      确认抽取
+                    </Button>
+                  </div>
+                </>
               )
             },
             {
               key: 'upload',
-              label: '上传文档',
+              label: '上传新文档并抽取',
               children: (
-                <div style={{ paddingTop: 4 }}>
-                  <Upload
-                    beforeUpload={handlePickUploadFile}
-                    showUploadList={false}
-                    accept=".pdf,.jpg,.jpeg,.png,.doc,.docx"
+                <div style={{ padding: '16px 0', textAlign: 'center' }}>
+                  <Text type="secondary" style={{ display: 'block', marginBottom: 16 }}>
+                    点击下方按钮选择文件上传，上传完成后将自动进行文档抽取
+                  </Text>
+                  <Button
+                    type="primary"
+                    icon={<UploadOutlined />}
+                    onClick={() => uploadFileInputRef.current?.click()}
+                    style={{ marginBottom: 8 }}
                   >
-                    <Button icon={<UploadOutlined />}>选择文档</Button>
-                  </Upload>
-                  <div style={{ marginTop: 12 }}>
-                    {selectedUploadFile ? (
-                      <div style={{ padding: '8px 12px', background: '#f6ffed', border: '1px solid #b7eb8f', borderRadius: 6 }}>
-                        <Text>已选择：{selectedUploadFile.name}</Text>
-                      </div>
-                    ) : (
-                      <Text type="secondary">支持 PDF / 图片 / Word。选择文件后点击“确认抽取”。</Text>
-                    )}
-                  </div>
+                    选择文件
+                  </Button>
+                  <Text type="secondary" style={{ display: 'block', fontSize: 12 }}>
+                    支持 PDF、JPG、JPEG、PNG，单个文件最大 50MB
+                  </Text>
+                  <input
+                    ref={uploadFileInputRef}
+                    type="file"
+                    style={{ display: 'none' }}
+                    accept=".pdf,.jpg,.jpeg,.png"
+                    onChange={handleUploadExtractFile}
+                  />
                 </div>
               )
             }
@@ -2055,9 +2171,8 @@ const SchemaFormInner = ({ onSave, onReset, onFieldCandidateSolidified, external
               onToggleAutoSave: () => setAutoSaveEnabled(!autoSaveEnabled),
               isDirty
             }}
-            onUploadDocument={onToolbarUploadDocument}
+            onUploadDocument={() => handleOpenUploadExtractModal('existing')}
             beforeUploadActions={beforeUploadActions}
-            beforeAutoActions={documentExtractToolbarAction}
           />
         </div>
         {showSourcePanel && (
@@ -2103,7 +2218,7 @@ const SchemaForm = ({ schema, enums = {}, patientData, patientId, projectId, onS
   return (
     <div style={{ height: contentAdaptive ? 'auto' : '100%', ...style }}>
       <SchemaFormProvider schema={schema} enums={enums} patientData={patientData}>
-        <SchemaFormInner onSave={onSave} onReset={onReset} onFieldCandidateSolidified={onFieldCandidateSolidified} externalHistoryRefreshKey={externalHistoryRefreshKey} autoSaveInterval={autoSaveInterval} siderWidth={siderWidth} sourcePanelWidth={sourcePanelWidth} collapsible={collapsible} showSourcePanel={showSourcePanel} projectMode={projectMode} projectConfig={projectConfig} projectId={projectId} patientId={resolvedPatientId} contentAdaptive={contentAdaptive} leftHeader={leftHeader} collapsedTitle={collapsedTitle} onToolbarUploadDocument={onUploadDocument} beforeUploadActions={beforeUploadActions} />
+        <SchemaFormInner onSave={onSave} onReset={onReset} onFieldCandidateSolidified={onFieldCandidateSolidified} externalHistoryRefreshKey={externalHistoryRefreshKey} autoSaveInterval={autoSaveInterval} siderWidth={siderWidth} sourcePanelWidth={sourcePanelWidth} collapsible={collapsible} showSourcePanel={showSourcePanel} projectMode={projectMode} projectConfig={projectConfig} projectId={projectId} patientId={resolvedPatientId} contentAdaptive={contentAdaptive} leftHeader={leftHeader} collapsedTitle={collapsedTitle} beforeUploadActions={beforeUploadActions} />
       </SchemaFormProvider>
     </div>
   )

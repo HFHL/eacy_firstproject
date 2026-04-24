@@ -12,10 +12,8 @@
  *   - 后续步骤（详情弹窗、LLM 日志、SSE）会在同文件扩展。
  */
 import { Router, Request, Response } from 'express'
-import fs from 'node:fs'
-import path from 'node:path'
-import readline from 'node:readline'
 import db from '../db.js'
+import { CRF_SERVICE_URL } from '../services/crfServiceClient.js'
 
 const router = Router()
 
@@ -405,51 +403,6 @@ router.get('/extraction-tasks', (req: Request, res: Response) => {
   }
 })
 
-// ─── LLM JSONL 读取 ─────────────────────────────────────────────────────────
-//
-// 说明：crf-service 把每次 LLM 调用以 JSON 行格式写入 logs/ehr_extractor_llm.jsonl。
-// 字段布局参考 app/core/extractor_agent.py：
-//   llm_request   → kind, call_id, started_at, task_name, task_path, document_id, instruction, user_message
-//   llm_response  → kind, call_id, started_at, finished_at, elapsed_ms, extracted_raw, parsed, validation_log
-//   llm_exception → kind, call_id, started_at, finished_at, error, traceback
-//
-// 当前没有 job_id 关联字段，因此只能按 document_id + 时间窗口软关联。
-// Step 3 会新增 llm_call_logs 表做双写，届时这里的"文件读"降级为 fallback。
-
-type LLMLogEntry = Record<string, any>
-
-const LLM_LOG_PATH = process.env.LLM_LOG_PATH
-  ? path.resolve(process.env.LLM_LOG_PATH)
-  : path.resolve(process.cwd(), '..', 'crf-service', 'logs', 'ehr_extractor_llm.jsonl')
-
-// 简单内存缓存：按文件 size+mtime 失效。避免每次详情请求都重读 3MB。
-let llmCache: { key: string; entries: LLMLogEntry[] } | null = null
-
-async function readLlmLog(): Promise<LLMLogEntry[]> {
-  let stat: fs.Stats
-  try {
-    stat = fs.statSync(LLM_LOG_PATH)
-  } catch {
-    return []
-  }
-  const key = `${stat.size}:${stat.mtimeMs}`
-  if (llmCache && llmCache.key === key) return llmCache.entries
-
-  const entries: LLMLogEntry[] = []
-  const stream = fs.createReadStream(LLM_LOG_PATH, { encoding: 'utf8' })
-  const rl = readline.createInterface({ input: stream, crlfDelay: Infinity })
-  for await (const raw of rl) {
-    const line = raw.trim()
-    if (!line) continue
-    try {
-      const obj = JSON.parse(line)
-      if (obj && typeof obj === 'object') entries.push(obj)
-    } catch { /* skip malformed */ }
-  }
-  llmCache = { key, entries }
-  return entries
-}
-
 interface LLMCallPair {
   call_id: string | null
   document_id: string | null
@@ -467,89 +420,59 @@ interface LLMCallPair {
   error: string | null
 }
 
-/**
- * 把 JSONL 三种事件 (request / response / exception) 按 call_id 配成 LLMCallPair。
- */
-function pairLlmEntries(entries: LLMLogEntry[]): LLMCallPair[] {
-  const byCall = new Map<string, { req?: LLMLogEntry; resp?: LLMLogEntry; exc?: LLMLogEntry }>()
-  const orphans: LLMLogEntry[] = []
-  for (const e of entries) {
-    const cid = e.call_id ? String(e.call_id) : ''
-    if (!cid) { orphans.push(e); continue }
-    if (!byCall.has(cid)) byCall.set(cid, {})
-    const slot = byCall.get(cid)!
-    if (e.kind === 'llm_request') slot.req = e
-    else if (e.kind === 'llm_response') slot.resp = e
-    else if (e.kind === 'llm_exception') slot.exc = e
+// ─── llm_call_logs 数据库查询 ───────────────────────────────────────────────
+//
+// crf-service 把每次 LLM 调用写入 llm_call_logs 表（含 job_id），
+// 这里仅用 job_id 精确拉取，不再从 JSONL 做软关联。
+
+function readLlmCallsFromDb(jobIds: string[]): LLMCallPair[] {
+  if (jobIds.length === 0) return []
+  // 表由 db.ts 里 llmCallLogsDdl 创建；历史库可能尚未建，catch 后返回空列表。
+  let rows: any[] = []
+  try {
+    rows = db.prepare(`
+      SELECT call_id, job_id, document_id, task_name, task_path,
+             status, started_at, finished_at, elapsed_ms,
+             instruction, user_message, extracted_raw, parsed, validation_log,
+             error_message
+      FROM llm_call_logs
+      WHERE job_id IN (${jobIds.map(() => '?').join(',')})
+      ORDER BY COALESCE(started_at, created_at) ASC
+    `).all(...jobIds) as any[]
+  } catch (err) {
+    console.warn('[admin/extraction-tasks] llm_call_logs 查询失败:', err)
+    return []
   }
-  const pairs: LLMCallPair[] = []
-  for (const [cid, slot] of byCall.entries()) {
-    const req = slot.req || {}
-    const resp = slot.resp
-    const exc = slot.exc
-    const out: LLMCallPair = {
-      call_id: cid,
-      document_id: (req.document_id || resp?.document_id || exc?.document_id) || null,
-      task_name: (req.task_name || resp?.task_name || exc?.task_name) || null,
-      task_path: (req.task_path || resp?.task_path || exc?.task_path) || null,
-      started_at: (req.started_at || resp?.started_at || exc?.started_at) || null,
-      finished_at: (resp?.finished_at || exc?.finished_at) || null,
-      elapsed_ms: resp?.elapsed_ms ?? exc?.elapsed_ms ?? null,
-      status: exc ? 'error' : resp ? 'success' : 'pending',
-      instruction: req.instruction ?? null,
-      user_message: req.user_message ?? null,
-      extracted_raw: resp?.extracted_raw ?? null,
-      parsed: resp?.parsed ?? null,
-      validation_log: resp?.validation_log ?? null,
-      error: exc?.error ? String(exc.error).slice(0, 2000) : null,
+
+  const parseMaybeJson = (raw: unknown): unknown => {
+    if (raw == null) return null
+    if (typeof raw !== 'string') return raw
+    const trimmed = raw.trim()
+    if (!trimmed) return null
+    if (trimmed.startsWith('{') || trimmed.startsWith('[')) {
+      try { return JSON.parse(trimmed) } catch { return raw }
     }
-    pairs.push(out)
-  }
-  return pairs
-}
-
-/**
- * 根据文档 id 集合 + 时间窗口筛 pairs，避免同一文档历史日志全部拉出来。
- * window = 24h 兜底（文档跨天重复抽取的场景极少，同时避免长时间窗穿帮）。
- */
-function pickLlmCallsForJobs(
-  pairs: LLMCallPair[],
-  jobs: JobDetail[],
-): LLMCallPair[] {
-  const docIds = new Set<string>(
-    jobs.map((j) => j.document_id).filter((v): v is string => !!v)
-  )
-  if (docIds.size === 0) return []
-
-  // 为每个文档建立允许的时间区间 = min(job.started_at) - 5min ~ max(job.completed_at || now) + 5min
-  const WINDOW_MS = 24 * 60 * 60 * 1000
-  const docWindows = new Map<string, { start: number; end: number }>()
-  for (const j of jobs) {
-    if (!j.document_id) continue
-    const startMs = j.started_at ? Date.parse(j.started_at) : Date.parse(j.created_at)
-    const endMs = j.completed_at ? Date.parse(j.completed_at) : startMs + WINDOW_MS
-    if (!Number.isFinite(startMs)) continue
-    const prev = docWindows.get(j.document_id) || { start: startMs, end: endMs }
-    docWindows.set(j.document_id, {
-      start: Math.min(prev.start, startMs) - 5 * 60 * 1000,
-      end: Math.max(prev.end, endMs) + 5 * 60 * 1000,
-    })
+    return raw
   }
 
-  return pairs
-    .filter((p) => {
-      if (!p.document_id || !docIds.has(p.document_id)) return false
-      const win = docWindows.get(p.document_id)
-      if (!win) return true
-      const ts = p.started_at ? Date.parse(p.started_at) : NaN
-      if (!Number.isFinite(ts)) return true
-      return ts >= win.start && ts <= win.end
-    })
-    .sort((a, b) => {
-      const aTs = a.started_at || ''
-      const bTs = b.started_at || ''
-      return aTs.localeCompare(bTs)
-    })
+  return rows.map((r) => ({
+    call_id: String(r.call_id),
+    document_id: r.document_id || null,
+    task_name: r.task_name || null,
+    task_path: r.task_path ? (parseMaybeJson(r.task_path) as any) : null,
+    started_at: r.started_at || null,
+    finished_at: r.finished_at || null,
+    elapsed_ms: r.elapsed_ms ?? null,
+    status: (r.status === 'success' || r.status === 'error' || r.status === 'pending')
+      ? r.status as 'success' | 'error' | 'pending'
+      : 'pending',
+    instruction: r.instruction ?? null,
+    user_message: r.user_message ?? null,
+    extracted_raw: parseMaybeJson(r.extracted_raw),
+    parsed: parseMaybeJson(r.parsed),
+    validation_log: parseMaybeJson(r.validation_log),
+    error: r.error_message ? String(r.error_message).slice(0, 2000) : null,
+  }))
 }
 
 // ─── 详情接口 ───────────────────────────────────────────────────────────────
@@ -799,14 +722,14 @@ router.get('/extraction-tasks/:id', async (req: Request, res: Response) => {
     }
 
     let llmCalls: LLMCallPair[] = []
+    const llmSource: 'db' = 'db'
     if (includeLlm) {
-      try {
-        const entries = await readLlmLog()
-        const pairs = pairLlmEntries(entries)
-        llmCalls = pickLlmCallsForJobs(pairs, jobDetails)
-      } catch (llmErr) {
-        console.warn('[admin/extraction-tasks/:id] LLM 日志读取失败:', llmErr)
-      }
+      const jobIds = jobDetails.map((j) => j.id)
+      llmCalls = readLlmCallsFromDb(jobIds).sort((a, b) => {
+        const aTs = a.started_at || ''
+        const bTs = b.started_at || ''
+        return aTs.localeCompare(bTs)
+      })
     }
 
     return res.json({
@@ -817,6 +740,7 @@ router.get('/extraction-tasks/:id', async (req: Request, res: Response) => {
         summary,
         jobs: jobDetails,
         llm_calls: llmCalls,
+        llm_source: llmSource,
       },
     })
   } catch (err: any) {
@@ -827,6 +751,110 @@ router.get('/extraction-tasks/:id', async (req: Request, res: Response) => {
       message: err?.message || '查询任务详情失败',
       data: null,
     })
+  }
+})
+
+/**
+ * GET /api/v1/admin/extraction-tasks/:id/progress
+ * SSE 反代：把 crf-service `/api/extract/{job_id}/progress` 的事件流
+ * 原样转发给前端。这样前端只需认识同源的一个地址，不必直接跨域连 crf-service。
+ *
+ * id 可以是：
+ *   - project_extraction_tasks.id → 用该任务的 primary_job_id 作为订阅频道
+ *     （批量任务可能有多个并发 job；此处只跟踪 primary，列表里的详细 jobs 状态
+ *     仍靠 REST 轮询看到；如果需要多 job 同时跟踪，可以未来扩展 EventSource 组）
+ *   - ehr_extraction_jobs.id → 直接使用该 job id
+ *
+ * 终态（status=completed|failed|cancelled）时 upstream 会自然结束，此接口同步 end。
+ */
+router.get('/extraction-tasks/:id/progress', async (req: Request, res: Response) => {
+  const id = req.params.id
+
+  // 1) 把 public task id 映射成 crf-service 用的 job_id
+  //
+  // 优先级：project_extraction_tasks.job_ids_json[0] → ehr_extraction_jobs.id
+  // （批量任务可能同时跑多个 job，这里只跟踪第一个；详情页里的各 job 状态仍由 REST 刷新体现）
+  let jobId: string | null = null
+  try {
+    const projectRow = db
+      .prepare(`SELECT id, job_ids_json FROM project_extraction_tasks WHERE id = ?`)
+      .get(id) as any
+    if (projectRow) {
+      const jobIds = normalizeStringList(parseJsonArray(projectRow.job_ids_json))
+      jobId = jobIds[0] || null
+    }
+    if (!jobId) {
+      const jobRow = db.prepare(`SELECT id FROM ehr_extraction_jobs WHERE id = ?`).get(id) as any
+      if (jobRow) jobId = String(jobRow.id)
+    }
+  } catch (err) {
+    console.error('[admin/extraction-tasks/:id/progress] id→job_id 解析失败:', err)
+  }
+
+  // 统一 SSE 头（即便接下来 404 / upstream 失败，前端 EventSource 也需要这套头才能正确识别连接）
+  res.setHeader('Content-Type', 'text/event-stream; charset=utf-8')
+  res.setHeader('Cache-Control', 'no-cache, no-transform')
+  res.setHeader('Connection', 'keep-alive')
+  res.setHeader('X-Accel-Buffering', 'no')
+  if (typeof (res as any).flushHeaders === 'function') {
+    ;(res as any).flushHeaders()
+  }
+
+  if (!jobId) {
+    // 推一条 error 事件后结束，前端 hook 可以据此展示"未关联 job"。
+    res.write(`event: error\ndata: ${JSON.stringify({ message: '未找到对应的抽取任务或尚未关联 job_id' })}\n\n`)
+    res.end()
+    return
+  }
+
+  // 2) 反代到 crf-service
+  const upstreamUrl = `${CRF_SERVICE_URL}/api/extract/${encodeURIComponent(jobId)}/progress`
+  const abort = new AbortController()
+  req.on('close', () => abort.abort())
+
+  try {
+    const upstream = await fetch(upstreamUrl, {
+      signal: abort.signal,
+      headers: { Accept: 'text/event-stream' },
+    })
+
+    if (!upstream.ok || !upstream.body) {
+      res.write(
+        `event: error\ndata: ${JSON.stringify({
+          message: `upstream ${upstream.status} ${upstream.statusText || ''}`.trim(),
+        })}\n\n`,
+      )
+      res.end()
+      return
+    }
+
+    // 初始化事件：告诉前端现在订阅到了哪个 job_id，方便调试。
+    res.write(`event: meta\ndata: ${JSON.stringify({ job_id: jobId, task_id: id })}\n\n`)
+
+    const reader = (upstream.body as any).getReader()
+    const decoder = new TextDecoder()
+    while (true) {
+      const { value, done } = await reader.read()
+      if (done) break
+      if (value) {
+        // 原样透传：upstream 已经是 SSE 格式（"data: ...\n\n"）。
+        res.write(decoder.decode(value, { stream: true }))
+      }
+    }
+    res.end()
+  } catch (err: any) {
+    if (err?.name === 'AbortError') {
+      // 客户端主动断开：正常结束，不刷日志。
+      try { res.end() } catch { /* ignore */ }
+      return
+    }
+    console.error('[admin/extraction-tasks/:id/progress] SSE proxy error:', err)
+    try {
+      res.write(
+        `event: error\ndata: ${JSON.stringify({ message: String(err?.message || err) })}\n\n`,
+      )
+    } catch { /* ignore */ }
+    try { res.end() } catch { /* ignore */ }
   }
 })
 

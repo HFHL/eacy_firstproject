@@ -127,4 +127,40 @@ for (const stmt of projectBootstrap) {
   }
 }
 
+// LLM 调用日志表：由 crf-service/extractor_agent 在 JSONL 之外双写，
+// 供 /api/v1/admin/extraction-tasks/:id 详情接口按 job_id 精确检索。
+const llmCallLogsDdl = [
+  `CREATE TABLE IF NOT EXISTS llm_call_logs (
+    call_id         TEXT PRIMARY KEY,
+    job_id          TEXT,
+    document_id     TEXT,
+    patient_id      TEXT,
+    schema_id       TEXT,
+    task_name       TEXT,
+    task_path       TEXT,
+    kind            TEXT NOT NULL DEFAULT 'request',
+    status          TEXT NOT NULL DEFAULT 'pending',
+    started_at      TEXT,
+    finished_at     TEXT,
+    elapsed_ms      INTEGER,
+    instruction     TEXT,
+    user_message    TEXT,
+    extracted_raw   TEXT,
+    parsed          TEXT,
+    validation_log  TEXT,
+    stream_events   TEXT,
+    error_message   TEXT,
+    traceback_text  TEXT,
+    created_at      TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+    updated_at      TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+  )`,
+  `CREATE INDEX IF NOT EXISTS idx_llm_call_job      ON llm_call_logs(job_id)`,
+  `CREATE INDEX IF NOT EXISTS idx_llm_call_doc      ON llm_call_logs(document_id)`,
+  `CREATE INDEX IF NOT EXISTS idx_llm_call_patient  ON llm_call_logs(patient_id)`,
+  `CREATE INDEX IF NOT EXISTS idx_llm_call_started  ON llm_call_logs(started_at)`,
+]
+for (const stmt of llmCallLogsDdl) {
+  try { db.exec(stmt) } catch { /* 忽略已存在 */ }
+}
+
 export default db

@@ -253,6 +253,18 @@ async def node_extract_units(state: CRFExtractionState) -> Dict[str, Any]:
             "progress": {"node": "extract_units", "status": "skipped", "reason": "no_units"},
         }
 
+    # 注入 LLM 调用上下文：extractor_agent 里 _append_llm_jsonl_log / _write_llm_db_log
+    # 会自动读取该 ContextVar 把 job_id/patient_id/schema_id 写到 JSONL + llm_call_logs 表。
+    try:
+        from app.core.extractor_agent import _llm_context as _extractor_llm_ctx  # noqa: WPS433
+        _extractor_llm_ctx.set({
+            "job_id": state.get("job_id"),
+            "patient_id": state.get("patient_id"),
+            "schema_id": state.get("schema_id"),
+        })
+    except Exception as _ctx_exc:  # pragma: no cover
+        logger.debug("注入 LLM 调用上下文失败: %s", _ctx_exc)
+
     results: List[Dict[str, Any]] = []
     errors: List[str] = []
     total = len(units)

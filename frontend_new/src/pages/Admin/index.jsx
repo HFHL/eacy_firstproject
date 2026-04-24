@@ -18,6 +18,24 @@ import {
   getAdminExtractionTaskDetail
 } from '../../api/admin'
 import { appThemeToken } from '../../styles/themeTokens'
+import { useExtractionProgressSSE } from '../../hooks'
+
+// ─── 抽取流程节点展示（SSE 事件里 node 字段 → 中文 + 图标色） ────────────
+const NODE_META = {
+  start:                 { label: '任务开始', color: 'processing' },
+  load_schema_and_docs:  { label: '加载 Schema & 文档', color: 'blue' },
+  filter_units:          { label: '筛选可抽取单元', color: 'blue' },
+  extract_units:         { label: 'LLM 抽取', color: 'geekblue' },
+  materialize:           { label: '物化落库', color: 'purple' },
+  done:                  { label: '完成', color: 'success' },
+  error:                 { label: '异常', color: 'error' },
+  timeout:               { label: '超时', color: 'error' },
+  meta:                  { label: '订阅建立', color: 'default' },
+  proxy_error:           { label: '通道异常', color: 'error' },
+  init:                  { label: '当前状态', color: 'default' },
+}
+
+const nodeMeta = (node) => NODE_META[node] || { label: node || '-', color: 'default' }
 
 const { Text } = Typography
 
@@ -337,9 +355,92 @@ const LLMCallList = ({ calls }) => {
 }
 
 // 任务详情弹窗：展示 summary、jobs 列表（含 extraction_run）、LLM 调用
+// 小组件：running 状态下展示 SSE 实时进度流（时间线）
+// terminal=true 时上层 Modal 会 refetch 详情把 status 翻到最终态。
+const ExtractionProgressStream = ({ events, status, terminal, error }) => {
+  const hasEvents = events && events.length > 0
+
+  const streamBadge = (() => {
+    if (error) return { status: 'error', text: '连接中断' }
+    if (terminal) return { status: 'success', text: '已完成' }
+    if (status === 'open') return { status: 'processing', text: '实时接收中' }
+    if (status === 'connecting') return { status: 'processing', text: '连接中' }
+    if (status === 'closed') return { status: 'default', text: '已断开' }
+    return { status: 'default', text: '未连接' }
+  })()
+
+  return (
+    <div>
+      <Space style={{ marginBottom: 8 }}>
+        <Badge status={streamBadge.status} text={<Text type="secondary">{streamBadge.text}</Text>} />
+        <Text type="secondary" style={{ fontSize: 12 }}>共 {events.length} 条事件</Text>
+      </Space>
+      {!hasEvents ? (
+        <Alert
+          type="info"
+          showIcon
+          message="正在等待进度事件"
+          description="crf-service 每完成一个图节点会推送一条事件；若长时间未收到，可能 worker 还没领到任务、或 Celery broker 不可达。"
+        />
+      ) : (
+        <div
+          style={{
+            maxHeight: 240,
+            overflowY: 'auto',
+            border: `1px solid ${appThemeToken.colorBorderSecondary}`,
+            borderRadius: 6,
+            padding: 8,
+            background: appThemeToken.colorBgLayout,
+          }}
+        >
+          {events.map((ev, idx) => {
+            const meta = nodeMeta(ev.node)
+            const ts = new Date(ev.ts).toLocaleTimeString('zh-CN', { hour12: false })
+            const highlight = ev.type === 'error' || ev.status === 'failed'
+            return (
+              <div
+                key={idx}
+                style={{
+                  display: 'flex',
+                  gap: 8,
+                  alignItems: 'flex-start',
+                  padding: '4px 0',
+                  borderBottom: idx === events.length - 1 ? 'none' : `1px dashed ${appThemeToken.colorBorderSecondary}`,
+                }}
+              >
+                <Text type="secondary" style={{ fontSize: 11, minWidth: 72, fontFamily: 'monospace' }}>{ts}</Text>
+                <Tag color={meta.color} style={{ margin: 0, minWidth: 96, textAlign: 'center' }}>
+                  {meta.label}
+                </Tag>
+                <div style={{ flex: 1, minWidth: 0 }}>
+                  {ev.status && (
+                    <Tag
+                      color={extractionStatusMeta[ev.status]?.color || 'default'}
+                      style={{ marginRight: 6 }}
+                    >
+                      {extractionStatusMeta[ev.status]?.label || ev.status}
+                    </Tag>
+                  )}
+                  <Text
+                    type={highlight ? 'danger' : undefined}
+                    style={{ fontSize: 12, wordBreak: 'break-all' }}
+                  >
+                    {ev.message || ev.reason || '—'}
+                  </Text>
+                </div>
+              </div>
+            )
+          })}
+        </div>
+      )}
+    </div>
+  )
+}
+
 const ExtractionTaskDetailModal = ({ open, taskId, onClose }) => {
   const [detail, setDetail] = useState(null)
   const [loading, setLoading] = useState(false)
+  const [refreshKey, setRefreshKey] = useState(0)
 
   useEffect(() => {
     if (!open || !taskId) return
@@ -351,9 +452,26 @@ const ExtractionTaskDetailModal = ({ open, taskId, onClose }) => {
       .catch(() => { if (!aborted) message.error('加载任务详情失败') })
       .finally(() => { if (!aborted) setLoading(false) })
     return () => { aborted = true }
-  }, [open, taskId])
+  }, [open, taskId, refreshKey])
+
+  // 只有 running 的任务才订阅 SSE；其它状态没有进度事件
+  const isRunning = detail?.summary?.status === 'running' || detail?.summary?.status === 'pending'
+  const {
+    events: progressEvents,
+    status: sseStatus,
+    terminal: sseTerminal,
+    error: sseError,
+  } = useExtractionProgressSSE(taskId, { enabled: open && !!taskId && isRunning })
+
+  // 终态到达 → 触发一次 detail 刷新，把 status、llm_calls、jobs 都换到最终态
+  useEffect(() => {
+    if (sseTerminal) {
+      setRefreshKey((k) => k + 1)
+    }
+  }, [sseTerminal])
 
   const summary = detail?.summary
+  const llmSource = detail?.llm_source || null
   const jobs = detail?.jobs || []
   const llmCalls = detail?.llm_calls || []
 
@@ -523,6 +641,23 @@ const ExtractionTaskDetailModal = ({ open, taskId, onClose }) => {
             )}
           </Descriptions>
 
+          {isRunning && (
+            <>
+              <Divider orientation="left" style={{ marginTop: 24 }}>
+                <Space>
+                  <SyncOutlined spin={sseStatus === 'open' || sseStatus === 'connecting'} />
+                  <span>实时进度</span>
+                </Space>
+              </Divider>
+              <ExtractionProgressStream
+                events={progressEvents}
+                status={sseStatus}
+                terminal={sseTerminal}
+                error={sseError}
+              />
+            </>
+          )}
+
           <Divider orientation="left" style={{ marginTop: 24 }}>
             <Space>
               <FileTextOutlined />
@@ -542,9 +677,11 @@ const ExtractionTaskDetailModal = ({ open, taskId, onClose }) => {
             <Space>
               <ExperimentOutlined />
               <span>LLM 调用明细（{llmCalls.length}）</span>
-              <Tooltip title="按文档 id + 时间窗口从 crf-service/logs/ehr_extractor_llm.jsonl 关联">
-                <Text type="secondary" style={{ fontSize: 12 }}>软关联</Text>
-              </Tooltip>
+              {llmSource === 'db' && (
+                <Tooltip title="来自 llm_call_logs 表，按 job_id 精确关联">
+                  <Tag color="green" style={{ margin: 0 }}>DB 精准</Tag>
+                </Tooltip>
+              )}
             </Space>
           </Divider>
           {llmCalls.length === 0 ? (
@@ -552,7 +689,7 @@ const ExtractionTaskDetailModal = ({ open, taskId, onClose }) => {
               type="info"
               showIcon
               message="未检索到 LLM 调用日志"
-              description="可能该任务的日志文件已被归档、或 crf-service 未启用 LLM 文件日志。第 3 步会改为表级索引，提供更稳的关联。"
+              description="llm_call_logs 表里没有关联这个任务的记录（可能任务未真正发起 LLM 调用，或任务早于 DB 日志写入上线）。"
             />
           ) : (
             <LLMCallList calls={llmCalls} />
@@ -590,6 +727,18 @@ const ExtractionTasksTab = () => {
   }, [typeFilter, statusFilter])
 
   useEffect(() => { fetchTasks() }, [fetchTasks])
+
+  // 如果当前有任何 running/pending 任务，开启 5s 轻量轮询，让列表里的进度列
+  // 能跟着 SSE 推送的终态一起翻面。SSE 留给详情弹窗逐节点看；列表只需汇总。
+  const hasLiveTask = useMemo(
+    () => (rawData.items || []).some((r) => r.status === 'running' || r.status === 'pending'),
+    [rawData.items],
+  )
+  useEffect(() => {
+    if (!hasLiveTask) return undefined
+    const timer = setInterval(() => { fetchTasks() }, 5000)
+    return () => clearInterval(timer)
+  }, [hasLiveTask, fetchTasks])
 
   // 前端搜索：按 patient_name / project_name / schema_name / id 做模糊匹配
   const filtered = useMemo(() => {

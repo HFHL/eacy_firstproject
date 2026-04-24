@@ -32,6 +32,7 @@ import {
 import dayjs from 'dayjs'
 import { maskSensitiveField } from '@/utils/sensitiveUtils'
 import { appThemeToken } from '@/styles/themeTokens'
+import PdfPageWithHighlight from '@/components/PdfPageWithHighlight'
 
 const { Text, Title } = Typography
 
@@ -123,9 +124,9 @@ const HighlightedImage = ({ imageUrl, sourceLocation, loading }) => {
   const normalizeSourceLocation = (loc) => {
     if (!loc) return []
     if (Array.isArray(loc)) {
-      return loc.filter(item => item && item.bbox && Array.isArray(item.bbox) && item.bbox.length === 4)
+      return loc.filter(item => item && item.bbox && Array.isArray(item.bbox) && item.bbox.length >= 4)
     }
-    if (loc.bbox && Array.isArray(loc.bbox) && loc.bbox.length === 4) {
+    if (loc.bbox && Array.isArray(loc.bbox) && loc.bbox.length >= 4) {
       return [loc]
     }
     return []
@@ -237,9 +238,20 @@ const HighlightedImage = ({ imageUrl, sourceLocation, loading }) => {
    * @param {Array<number>} b [x1, y1, x2, y2]
    * @returns {Array<number>} [x1, y1, x2, y2]（当前图像像素坐标系）
    */
-  const toPixelBbox = (b) => {
+  const toPixelBbox = (loc) => {
+    const b = loc?.bbox
     if (!Array.isArray(b) || b.length < 4) return b
     const [x1, y1, x2, y2] = b.slice(0, 4).map(Number)
+    const pageW = Number(loc?.page_width || 0)
+    const pageH = Number(loc?.page_height || 0)
+    if (pageW > 0 && pageH > 0) {
+      return [
+        (x1 / pageW) * imgW,
+        (y1 / pageH) * imgH,
+        (x2 / pageW) * imgW,
+        (y2 / pageH) * imgH,
+      ]
+    }
     const maxV = Math.max(Math.abs(x1), Math.abs(y1), Math.abs(x2), Math.abs(y2))
     if (maxV <= 1100) {
       return [
@@ -255,7 +267,7 @@ const HighlightedImage = ({ imageUrl, sourceLocation, loading }) => {
   // 计算所有 bbox 的合并区域（用于裁剪显示）
   let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity
   const pixelBoxes = locations.map(loc => {
-    const [pixelX1, pixelY1, pixelX2, pixelY2] = toPixelBbox(loc.bbox)
+    const [pixelX1, pixelY1, pixelX2, pixelY2] = toPixelBbox(loc)
 
     minX = Math.min(minX, pixelX1)
     minY = Math.min(minY, pixelY1)
@@ -709,11 +721,13 @@ const RightPanel = ({
               </div>
             ) : documentImageUrl ? (
               traceIsPdf ? (
-                <div style={{ border: `1px solid ${appThemeToken.colorBorder}`, borderRadius: 6, overflow: 'hidden' }}>
-                  <iframe
-                    title="source-document-preview"
-                    src={documentImageUrl}
-                    style={{ width: '100%', height: '70vh', border: 0 }}
+                <div style={{ border: `1px solid ${appThemeToken.colorBorder}`, borderRadius: 6, overflow: 'auto', padding: 8, maxHeight: '70vh' }}>
+                  <PdfPageWithHighlight
+                    pdfUrl={documentImageUrl}
+                    pageNumber={Array.isArray(sourceLocation) ? null : (sourceLocation?.page ?? null)}
+                    locations={Array.isArray(sourceLocation) ? sourceLocation : (sourceLocation ? [sourceLocation] : [])}
+                    maxWidth="100%"
+                    loading={false}
                   />
                 </div>
               ) : traceIsImage ? (

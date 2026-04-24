@@ -1451,6 +1451,24 @@ router.post('/v2/documents/:documentId/move-to-group', (req: Request, res: Respo
 })
 
 /**
+ * GET /api/v1/documents/:id/pdf-stream
+ * 流式返回文档原始文件（供前端 PDF 渲染器直接使用）
+ * 直接 redirect 到 /uploads/{filename}，由 express.static 中间件服务
+ */
+router.get('/:id/pdf-stream', (req: Request, res: Response) => {
+  const row = stmtFindById.get(String(req.params.id)) as DocumentRecord | undefined
+  if (!row || row.status === 'deleted') {
+    return res.status(404).json({ success: false, code: 404, message: '文档不存在', data: null })
+  }
+  const objectKey = row.object_key || ''
+  if (!fs.existsSync(objectKey)) {
+    return res.status(404).json({ success: false, code: 404, message: '文件不存在于磁盘', data: null })
+  }
+  const fileName = path.basename(objectKey)
+  res.redirect(`/uploads/${encodeURIComponent(fileName)}`)
+})
+
+/**
  * GET /api/v1/documents/:id
  * 增强版文档详情：返回 normalized_metadata, linked_patients, content_list, extraction_records
  */
@@ -1617,14 +1635,19 @@ router.post('/:id/extract-metadata', (req: Request, res: Response) => {
     return res.status(404).json({ success: false, code: 404, message: '文档不存在', data: null })
   }
 
-  if (row.status !== 'ocr_succeeded') {
+  // 与 buildTaskProgress 的 OCR 判定逻辑对齐：ocr_status 或 status 任一信号即可
+  const ocrStatusCol = (row.ocr_status || '').toLowerCase()
+  const rawStatus = (row.status || '').toLowerCase()
+  const ocrDone =
+    ocrStatusCol === 'succeeded' || ocrStatusCol === 'completed' ||
+    rawStatus === 'ocr_succeeded' || rawStatus === 'archived' ||
+    !!row.raw_text || !!row.ocr_payload
+  if (!ocrDone) {
     return res.status(400).json({
       success: false, code: 400,
       message: '文档尚未完成 OCR 解析，无法抽取元数据', data: null
     })
   }
-
-  // 重置 meta_status 为 pending
   db.prepare(`
     UPDATE documents SET meta_status = 'pending', meta_error_message = NULL, updated_at = ? WHERE id = ?
   `).run(now(), String(req.params.id))
@@ -1649,7 +1672,14 @@ router.post('/:id/extract-ehr', async (req: Request, res: Response) => {
     return res.status(404).json({ success: false, code: 404, message: '文档不存在', data: null })
   }
 
-  if (row.status !== 'ocr_succeeded') {
+  // 与 buildTaskProgress 的 OCR 判定逻辑对齐：ocr_status 或 status 任一信号即可
+  const ocrStatusCol2 = (row.ocr_status || '').toLowerCase()
+  const rawStatus2 = (row.status || '').toLowerCase()
+  const ocrDone2 =
+    ocrStatusCol2 === 'succeeded' || ocrStatusCol2 === 'completed' ||
+    rawStatus2 === 'ocr_succeeded' || rawStatus2 === 'archived' ||
+    !!row.raw_text || !!row.ocr_payload
+  if (!ocrDone2) {
     return res.status(400).json({
       success: false, code: 400,
       message: '文档尚未完成 OCR 解析，无法进行 EHR 抽取', data: null
@@ -1669,13 +1699,15 @@ router.post('/:id/extract-ehr', async (req: Request, res: Response) => {
     })
   }
 
+  const targetSection = req.body.target_section || null;
   try {
-    const payload = {
+    const payload: Record<string, unknown> = {
       patient_id: patientId,
       schema_id: schemaId,
       document_ids: [String(req.params.id)],
-      instance_type: req.body.instance_type || 'patient_ehr'
+      instance_type: req.body.instance_type || 'patient_ehr',
     };
+    if (targetSection) payload.target_section = targetSection;
 
     const response = await crfServiceSubmitSingle(payload);
 

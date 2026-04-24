@@ -466,19 +466,21 @@ def ocr_payload_to_content_list(
                 text = (seg.get("text") or seg.get("content") or "").strip()
                 if not text:
                     continue
-                raw_page = seg.get("page_id", 0)
+                raw_page = seg.get("page_id", 1)
                 try:
-                    page_id = int(raw_page) if raw_page is not None else 0
+                    page_id = int(raw_page) if raw_page is not None else 1
                 except (TypeError, ValueError):
-                    page_id = 0
+                    page_id = 1
                 idx_in_page = page_seq[page_id]
                 page_seq[page_id] = idx_in_page + 1
                 block_id = f"p{page_id}.{idx_in_page}"
                 pos = seg.get("position")
-                bbox = None
-                if isinstance(pos, list) and len(pos) >= 8:
-                    bbox = [pos[0], pos[1], pos[4], pos[5]]
-                elif isinstance(pos, list) and len(pos) == 4:
+                bbox = seg.get("bbox")
+                if not bbox and isinstance(pos, list) and len(pos) >= 8:
+                    xs = [float(pos[i]) for i in range(0, 8, 2)]
+                    ys = [float(pos[i]) for i in range(1, 8, 2)]
+                    bbox = [min(xs), min(ys), max(xs), max(ys)]
+                elif not bbox and isinstance(pos, list) and len(pos) == 4:
                     bbox = pos
                 content_list.append(
                     {
@@ -486,8 +488,12 @@ def ocr_payload_to_content_list(
                         "bbox": bbox,
                         "text": text,
                         "page_id": page_id,
+                        "page_index": page_id - 1 if page_id > 0 else None,
                         "page_idx": page_id,
                         "position": pos,
+                        "page_width": seg.get("page_width"),
+                        "page_height": seg.get("page_height"),
+                        "page_angle": seg.get("page_angle"),
                         "type": seg.get("type"),
                         "sub_type": seg.get("sub_type"),
                     }

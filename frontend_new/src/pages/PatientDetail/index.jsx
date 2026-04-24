@@ -1648,6 +1648,7 @@ const PatientDetail = () => {
               children: (
                 <SchemaEhrTab
                   patientId={patientId}
+                  patientDocuments={documents}
                   onUploadDocument={() => setUploadVisible(true)}
                   onSave={async (data, type) => console.log('Schema保存', type, data)}
                   onDataChange={(data) => console.log('Schema数据变更', data)}

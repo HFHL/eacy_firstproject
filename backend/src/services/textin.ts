@@ -14,11 +14,15 @@ const TEXTIN_API_URL = 'https://api.textin.com/ai/service/v1/pdf_to_markdown'
 
 export interface OcrSegment {
   page_id:    number
+  page_index?: number | null
   page_angle: number   // 页面旋转角度（0 / 90 / 180 / 270）
   text:       string
   position:   number[] // 8 个整数：左上→右上→右下→左下
+  bbox?:      number[] | null
   type:       string   // paragraph | image | table
   sub_type:   string | null
+  page_width?: number | null
+  page_height?: number | null
 }
 
 export interface OcrResult {
@@ -104,11 +108,15 @@ export async function parseDocument(docId: string, objectKey: string): Promise<O
   // 3. 解析返回结构
   const result = json.result
 
-  // 建立 page_id → angle 映射
-  const angleMap: Record<number, number> = {}
+  // 建立 page_id → 页面信息映射
+  const pageInfoMap: Record<number, { width: number; height: number; angle: number }> = {}
   if (Array.isArray(result.pages)) {
     for (const page of result.pages) {
-      angleMap[page.page_id] = page.angle ?? 0
+      pageInfoMap[page.page_id] = {
+        width: page.width ?? page.page_width ?? 0,
+        height: page.height ?? page.page_height ?? 0,
+        angle: page.angle ?? 0,
+      }
     }
   }
 
@@ -119,13 +127,27 @@ export async function parseDocument(docId: string, objectKey: string): Promise<O
       // 跳过没有文本或坐标的条目
       if (!item.text || !item.position) continue
 
+      const pageId = item.page_id ?? 1
+      const info = pageInfoMap[pageId] ?? { width: 0, height: 0, angle: 0 }
+      const position = Array.isArray(item.position) && item.position.length >= 8 ? item.position : null
+      let bbox: number[] | null = null
+      if (position) {
+        const xs = [position[0], position[2], position[4], position[6]].map(Number)
+        const ys = [position[1], position[3], position[5], position[7]].map(Number)
+        bbox = [Math.min(...xs), Math.min(...ys), Math.max(...xs), Math.max(...ys)]
+      }
+
       segments.push({
-        page_id:    item.page_id,
-        page_angle: angleMap[item.page_id] ?? 0,
+        page_id:    pageId,
+        page_index: pageId > 0 ? pageId - 1 : null,
+        page_angle: info.angle,
         text:       item.text,
-        position:   item.position,
+        position:   position ?? item.position,
+        bbox,
         type:       item.type ?? 'paragraph',
         sub_type:   item.sub_type ?? null,
+        page_width: info.width || null,
+        page_height: info.height || null,
       })
     }
   }

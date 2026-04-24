@@ -35,15 +35,18 @@ const SchemaEhrTab = ({
   // Schema配置
   schemaPath = '/schema/patient_ehr-V2.schema.json',
   patientId = null,
-  
+
   // 患者数据
   patientData = null,
-  
+
+  // 患者关联文档（用于文档抽取弹窗）
+  patientDocuments = [],
+
   // 事件回调
   onSave,
   onDataChange,
   onUploadDocument,
-  
+
   // 配置选项
   autoSaveInterval = 30000,
   siderWidth = PATIENT_SCHEMA_FORM_LAYOUT_DEFAULTS.siderWidth,
@@ -267,6 +270,7 @@ const SchemaEhrTab = ({
           enums={enums}
           patientData={localPatientData}
           patientId={patientId}
+          projectConfig={{ documents: patientDocuments }}
           onUploadDocument={onUploadDocument}
           onSave={handleSave}
           onReset={handleReset}

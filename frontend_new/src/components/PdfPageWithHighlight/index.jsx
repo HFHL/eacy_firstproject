@@ -4,8 +4,10 @@
  * 用于文档溯源面板：当有 source_location（page + bbox）时，显示指定页并高亮区域。
  *
  * bbox 坐标系约定：
- * - 若后端返回归一化坐标（0–1000），则传入 bboxScale={1000}（默认），按比例映射到渲染宽高。
- * - 若后端返回 PDF 点坐标（与 PDF 页宽高一致），则传入 bboxScale="page"，按 PDF 页尺寸映射。
+ * - bboxScale="page"：bbox 直接为 PDF 点坐标，与 PDF 页宽高一致
+ * - bboxScale=1000（默认）：bbox 为 0-1000 归一化坐标
+ * - bbox 为原图像素坐标（如 Textin OCR 返回值）：按 PDF 页面填充整个嵌入
+ *   图像（宽高比相同）的关系，直接以 PDF 页面尺寸为基准等比缩放映射
  */
 import React, { useEffect, useRef, useState } from 'react'
 import { Spin } from 'antd'
@@ -21,7 +23,7 @@ const DEFAULT_BBOX_SCALE = 1000
 
 export function PdfPageWithHighlight({
   pdfUrl,
-  pageNumber = 1,
+  pageNumber = null,
   bbox,
   locations,
   maxWidth = 480,
@@ -45,8 +47,9 @@ export function PdfPageWithHighlight({
       ? [{ bbox, page: pageNumber }]
       : []
 
-  const targetPage = pageNumber || (list[0] && list[0].page != null ? Number(list[0].page) : 1)
+  const targetPage = pageNumber != null ? Number(pageNumber) : (list[0] && list[0].page != null ? Number(list[0].page) : 1)
   const pageIndex = Math.max(1, Math.floor(targetPage))
+  const visibleList = list.filter((loc) => loc.page == null || Number(loc.page) === pageIndex)
 
   useEffect(() => {
     if (!pdfUrl) {
@@ -120,10 +123,25 @@ export function PdfPageWithHighlight({
   const ph = pagePoints.height || refH
   const showSpinner = externalLoading || loading
 
+  /**
+   * 将 bbox 映射到 PDF canvas 像素坐标。
+   *
+   * 情况 1：bbox 为 PDF 页面点坐标（bboxScale="page"）
+   *   → 直接按 PDF 页尺寸映射
+   *
+   * 情况 2：bbox 为原图像素坐标（来自 OCR）
+   *   - 若 item.page_width/page_height（原图尺寸）已知：
+   *     按 PDF页尺寸 / 原图尺寸 的比例映射
+   *   - 否则（未传原图尺寸）自动检测：
+   *     若 max(bbox) > max(PDF_page)，判定为原图像素坐标，
+   *     用 PDF 页尺寸作为参考（假设 PDF 填充了同宽高比原图）
+   */
   const toRect = (item) => {
     const [x1, y1, x2, y2] = item.bbox
     const w = x2 - x1
     const h = y2 - y1
+
+    // 情况 1：PDF 点坐标
     if (usePageScale && pw > 0 && ph > 0) {
       return {
         left: (x1 / pw) * refW,
@@ -132,6 +150,42 @@ export function PdfPageWithHighlight({
         height: (h / ph) * refH,
       }
     }
+
+    // 情况 2：原图像素坐标
+    if (pw > 0 && ph > 0) {
+      // 有原图尺寸 → 用 PDF/原图 比例精确换算
+      const origW = item.page_width
+      const origH = item.page_height
+      if (origW > 0 && origH > 0) {
+        return {
+          left: (x1 / origW) * refW,
+          top: (y1 / origH) * refH,
+          width: (w / origW) * refW,
+          height: (h / origH) * refH,
+        }
+      }
+      // 无原图尺寸 → 自动检测（bbox 超 PDF 页 → 原图像素）
+      const maxBbox = Math.max(Math.abs(x1), Math.abs(y1), Math.abs(x2), Math.abs(y2))
+      const maxPage = Math.max(pw, ph)
+      if (maxBbox > maxPage * 1.1) {
+        // bbox 明显超出 PDF 页范围：用 PDF 页尺寸作为参考（等比假设）
+        return {
+          left: (x1 / maxPage) * pw,
+          top: (y1 / maxPage) * ph,
+          width: (w / maxPage) * pw,
+          height: (h / maxPage) * ph,
+        }
+      }
+      // bbox 在页范围内，视为已归一化到 PDF 页
+      return {
+        left: (x1 / pw) * refW,
+        top: (y1 / ph) * refH,
+        width: (w / pw) * refW,
+        height: (h / ph) * refH,
+      }
+    }
+
+    // 回退：使用 bboxScale 约定的 0-bboxScale 归一化
     const scale = refW / Number(bboxScale)
     const scaleY = refH / Number(bboxScale)
     return {
@@ -173,8 +227,18 @@ export function PdfPageWithHighlight({
             boxSizing: 'border-box',
           }}
         >
-          {list.map((item, idx) => {
+          {visibleList.map((item, idx) => {
             const rect = toRect(item)
+            console.debug('[PdfPageWithHighlight]', {
+              bbox: item.bbox,
+              pagePoints: { pw, ph },
+              canvasPx: { refW, refH },
+              rect,
+              leftPct: (rect.left / refW) * 100,
+              topPct: (rect.top / refH) * 100,
+              widthPct: (Math.max(rect.width, 2) / refW) * 100,
+              heightPct: (Math.max(rect.height, 2) / refH) * 100,
+            })
             const leftPct = (rect.left / refW) * 100
             const topPct = (rect.top / refH) * 100
             const widthPct = (Math.max(rect.width, 2) / refW) * 100

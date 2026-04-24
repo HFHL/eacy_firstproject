@@ -55,6 +55,8 @@ export const adaptProjectPatient = (patient) => {
       filled_count: stats.filled,
       total_count: stats.total,
       fields: group.fields || {},
+      records: Array.isArray(group.records) ? group.records : [],
+      is_repeatable: Boolean(group.is_repeatable),
     }
   })
 

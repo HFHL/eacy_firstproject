@@ -213,12 +213,13 @@ export const selectProjectCrfFieldCandidate = (
   patientId,
   fieldPath,
   candidateId,
-  _selectedValue,
+  selectedValue,
   _rowUid = null
 ) => {
   return request.post(`/patients/${patientId}/ehr-field-candidates/select`, {
     field_path: fieldPath,
     candidate_id: candidateId,
+    ...(selectedValue !== undefined ? { selected_value: selectedValue } : {}),
     project_id: projectId,
   })
 }
@@ -232,7 +233,7 @@ export const selectProjectCrfFieldCandidate = (
  * @param {string} data.group_name - 分组
  */
 export const enrollPatient = (projectId, data) => {
-  return request.post(`/projects/${projectId}/patients/enroll`, data)
+  return request.post(`/projects/${projectId}/patients`, data)
 }
 
 /**
@@ -267,7 +268,9 @@ export const startCrfExtraction = (projectId, patientIds = null, mode = 'increme
  * @param {string} taskId - 任务 ID
  */
 export const getCrfExtractionProgress = (projectId, taskId) => {
-  return request.get(`/projects/${projectId}/crf/extraction/progress/${taskId}`)
+  return request.get(`/projects/${projectId}/crf/extraction/progress`, {
+    params: taskId ? { task_id: taskId } : undefined,
+  })
 }
 
 // ============== 项目内 CRF 模板（项目快照）=============
@@ -375,4 +378,3 @@ export default {
   exportProjectCrfFile,
   applyTemplateVersion,
 }
-
