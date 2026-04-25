@@ -51,6 +51,7 @@ const legacyAlters = [
   `ALTER TABLE documents ADD COLUMN created_at TEXT`,
   `ALTER TABLE documents ADD COLUMN updated_at TEXT`,
   `ALTER TABLE patients ADD COLUMN metadata TEXT NOT NULL DEFAULT '{}'`,
+  `ALTER TABLE schema_instances ADD COLUMN project_id TEXT NULL REFERENCES projects(id) ON DELETE CASCADE`,
 ]
 for (const stmt of legacyAlters) {
   try {
@@ -73,6 +74,11 @@ try {
 }
 
 db.exec(`CREATE INDEX IF NOT EXISTS idx_documents_batch_id ON documents(batch_id);`)
+try {
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_si_project ON schema_instances(project_id);`)
+} catch {
+  /* schema_instances 表尚不存在 */
+}
 
 // 科研项目：旧库若早于 projects 设计，增量建表（与 database_schema.sql 一致；不含外键重建）
 const projectBootstrap = [
@@ -125,6 +131,41 @@ for (const stmt of projectBootstrap) {
   } catch {
     /* 无 schemas/patients 等依赖表时跳过 */
   }
+}
+
+try {
+  db.exec(`ALTER TABLE schema_instances ADD COLUMN project_id TEXT NULL REFERENCES projects(id) ON DELETE CASCADE`)
+} catch {
+  /* 列已存在或 schema_instances 表尚不存在 */
+}
+try {
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_si_project ON schema_instances(project_id);`)
+} catch {
+  /* schema_instances 表尚不存在 */
+}
+try {
+  db.exec(`
+    UPDATE schema_instances
+    SET project_id = (
+      SELECT p.id
+      FROM projects p
+      JOIN project_patients pp ON pp.project_id = p.id
+      WHERE p.schema_id = schema_instances.schema_id
+        AND pp.patient_id = schema_instances.patient_id
+      LIMIT 1
+    )
+    WHERE instance_type = 'project_crf'
+      AND project_id IS NULL
+      AND 1 = (
+        SELECT COUNT(*)
+        FROM projects p
+        JOIN project_patients pp ON pp.project_id = p.id
+        WHERE p.schema_id = schema_instances.schema_id
+          AND pp.patient_id = schema_instances.patient_id
+      )
+  `)
+} catch {
+  /* 旧库缺少相关表时跳过 */
 }
 
 // LLM 调用日志表：由 crf-service/extractor_agent 在 JSONL 之外双写，

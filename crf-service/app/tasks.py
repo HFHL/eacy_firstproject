@@ -65,7 +65,9 @@ def run_extraction_task(
     schema_id: str,
     document_ids: Optional[list] = None,
     instance_type: str = "patient_ehr",
+    project_id: Optional[str] = None,
     target_section: Optional[str] = None,
+    target_sections: Optional[list] = None,
 ) -> Dict[str, Any]:
     """
     Celery task：执行完整的 CRF 抽取 pipeline。
@@ -93,6 +95,8 @@ def run_extraction_task(
     if job_id:
         try:
             with repo.connect() as conn:
+                primary_job = repo.get_job(conn, job_id)
+                job_type = primary_job.get("job_type") if primary_job else "extract"
                 claimed = repo.claim_job(conn, job_id)
                 if document_ids and len(document_ids) > 1:
                     placeholders = ",".join(["?"] * len(document_ids))
@@ -105,10 +109,11 @@ def run_extraction_task(
                             updated_at = ?
                         WHERE document_id IN ({placeholders})
                           AND schema_id = ?
+                          AND job_type = ?
                           AND status = 'pending'
                           AND id != ?
                         """,
-                        (_now_iso(), _now_iso(), *document_ids, schema_id, job_id),
+                        (_now_iso(), _now_iso(), *document_ids, schema_id, job_type, job_id),
                     )
                 conn.commit()
             if not claimed:
@@ -125,8 +130,13 @@ def run_extraction_task(
         "instance_type": instance_type,
         "errors": [],
     }
+    if project_id:
+        initial_state["project_id"] = project_id
     if document_ids:
         initial_state["document_ids"] = document_ids
+    clean_target_sections = [str(s).strip() for s in (target_sections or []) if str(s).strip()]
+    if clean_target_sections:
+        initial_state["target_sections"] = list(dict.fromkeys(clean_target_sections))
     if target_section:
         initial_state["target_section"] = target_section
 
@@ -285,6 +295,8 @@ def _finalize_jobs_by_outcome(
     materialized = set(materialized_doc_ids or [])
 
     with repo.connect() as conn:
+        primary_job = repo.get_job(conn, primary_job_id)
+        job_type = primary_job.get("job_type") if primary_job else "extract"
         # 1) primary job 结果
         if primary_job_id in {row["id"] for row in conn.execute(
             "SELECT id FROM ehr_extraction_jobs WHERE id = ?", (primary_job_id,)
@@ -306,10 +318,11 @@ def _finalize_jobs_by_outcome(
                         updated_at = ?
                     WHERE document_id IN ({m_placeholders})
                       AND schema_id = ?
+                      AND job_type = ?
                       AND status IN ('pending', 'running')
                       AND id != ?
                     """,
-                    (_now_iso(), instance_id, _now_iso(), *materialized, schema_id, primary_job_id),
+                    (_now_iso(), instance_id, _now_iso(), *materialized, schema_id, job_type, primary_job_id),
                 )
             # 3) 没命中的 sibling job：也推进到 completed（reason 写 last_error 避免 UI 误解为失败）
             conn.execute(
@@ -321,6 +334,7 @@ def _finalize_jobs_by_outcome(
                     updated_at = ?
                 WHERE document_id IN ({placeholders})
                   AND schema_id = ?
+                  AND job_type = ?
                   AND status IN ('pending', 'running')
                   AND id != ?
                 """,
@@ -330,6 +344,7 @@ def _finalize_jobs_by_outcome(
                     _now_iso(),
                     *document_ids,
                     schema_id,
+                    job_type,
                     primary_job_id,
                 ),
             )
@@ -349,6 +364,8 @@ def _mark_extraction_failed(
         return
     try:
         with repo.connect() as conn:
+            primary_job = repo.get_job(conn, job_id)
+            job_type = primary_job.get("job_type") if primary_job else "extract"
             repo.fail_job(conn, job_id, error_msg)
             if document_ids and len(document_ids) > 1:
                 placeholders = ",".join(["?"] * len(document_ids))
@@ -361,10 +378,11 @@ def _mark_extraction_failed(
                         updated_at = ?
                     WHERE document_id IN ({placeholders})
                       AND schema_id = ?
+                      AND job_type = ?
                       AND status IN ('pending', 'running')
                       AND id != ?
                     """,
-                    (error_msg[:4000], _now_iso(), _now_iso(), *document_ids, schema_id, job_id),
+                    (error_msg[:4000], _now_iso(), _now_iso(), *document_ids, schema_id, job_type, job_id),
                 )
             conn.commit()
     except Exception:

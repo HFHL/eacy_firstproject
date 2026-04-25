@@ -4,6 +4,65 @@
 
 import { normalizeTemplateFieldGroups, normalizeTemplateFieldMapping } from '../config/datasetContract'
 
+const normalizeSourceList = (value) => {
+  if (value == null) return []
+  if (typeof value === 'string') return value.trim() ? [value.trim()] : []
+  if (!Array.isArray(value)) return []
+  return value.map((item) => String(item ?? '').trim()).filter(Boolean)
+}
+
+const collectLeafFieldPaths = (schemaNode, path = []) => {
+  if (!schemaNode || typeof schemaNode !== 'object') return []
+  const target = schemaNode.type === 'array' && schemaNode.items && typeof schemaNode.items === 'object'
+    ? schemaNode.items
+    : schemaNode
+  const props = target.properties
+  if (!props || typeof props !== 'object' || Array.isArray(props)) {
+    return path.length > 0 ? [path.join('/')] : []
+  }
+  return Object.entries(props).flatMap(([key, child]) => collectLeafFieldPaths(child, [...path, key]))
+}
+
+export const deriveTemplateFieldGroupsFromSchema = (schema) => {
+  const rootProps = schema?.properties
+  if (!rootProps || typeof rootProps !== 'object' || Array.isArray(rootProps)) return []
+  const groups = []
+  Object.entries(rootProps).forEach(([folderKey, folderSchema], folderIndex) => {
+    if (!folderSchema || typeof folderSchema !== 'object' || Array.isArray(folderSchema)) return
+    const childProps = folderSchema.properties
+    if (childProps && typeof childProps === 'object' && !Array.isArray(childProps)) {
+      Object.entries(childProps).forEach(([groupKey, groupSchema], groupIndex) => {
+        if (!groupSchema || typeof groupSchema !== 'object' || Array.isArray(groupSchema)) return
+        const groupTitle = groupSchema.title || groupKey
+        groups.push({
+          group_id: `${folderKey}/${groupKey}`,
+          group_name: `${folderSchema.title || folderKey} / ${groupTitle}`,
+          db_fields: collectLeafFieldPaths(groupSchema, [folderKey, groupKey]),
+          is_repeatable: groupSchema.type === 'array',
+          order: folderIndex * 1000 + groupIndex,
+          sources: groupSchema['x-sources'] || folderSchema['x-sources'] || { primary: [], secondary: [] },
+        })
+      })
+      return
+    }
+    groups.push({
+      group_id: folderKey,
+      group_name: folderSchema.title || folderKey,
+      db_fields: collectLeafFieldPaths(folderSchema, [folderKey]),
+      is_repeatable: folderSchema.type === 'array',
+      order: folderIndex,
+      sources: folderSchema['x-sources'] || { primary: [], secondary: [] },
+    })
+  })
+  return groups.map((group) => ({
+    ...group,
+    sources: {
+      primary: normalizeSourceList(group.sources?.primary),
+      secondary: normalizeSourceList(group.sources?.secondary),
+    },
+  }))
+}
+
 /**
  * 判断字段值是否已填写。
  *
@@ -87,6 +146,8 @@ export const adaptProjectPatient = (patient) => {
     extractionMode,
     crf_data: crfData,
     crfGroups,
+    hasExtractionHistory: Boolean(patient?.has_extraction_history),
+    extractionHistory: patient?.extraction_history || null,
     document_count: patient?.document_count,
     patient_gender: patient?.patient_gender ?? null,
     patient_age: patient?.patient_age ?? null,
@@ -112,9 +173,10 @@ export const adaptProjectPatients = (patients) => {
  * @param {Record<string, any>} fieldMapping 字段映射。
  * @returns {{fieldGroups:Array<Record<string, any>>, fieldMapping:Record<string,string>}}
  */
-export const adaptTemplateMeta = (fieldGroups, fieldMapping) => {
+export const adaptTemplateMeta = (fieldGroups, fieldMapping, schema = null) => {
+  const normalizedGroups = normalizeTemplateFieldGroups(fieldGroups)
   return {
-    fieldGroups: normalizeTemplateFieldGroups(fieldGroups),
+    fieldGroups: normalizedGroups.length > 0 ? normalizedGroups : deriveTemplateFieldGroupsFromSchema(schema),
     fieldMapping: normalizeTemplateFieldMapping(fieldMapping),
   }
 }

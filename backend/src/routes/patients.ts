@@ -1,6 +1,6 @@
 import { Router, Request, Response } from 'express'
 import db from '../db.js'
-import { crfServiceSubmitBatch } from '../services/crfServiceClient.js'
+import { CRF_SERVICE_URL, crfServiceSubmitBatch } from '../services/crfServiceClient.js'
 
 const router = Router()
 
@@ -189,8 +189,20 @@ function getDefaultPatientEhrSchema() {
   return db.prepare(`
     SELECT id, name, code, version, content_json
     FROM schemas
-    WHERE code = 'patient_ehr_v2' AND is_active = 1
-    ORDER BY version DESC
+    WHERE is_active = 1
+      AND (
+        code = 'patient_ehr_v2'
+        OR code = 'patient_ehr_v2_crf'
+        OR schema_type = 'crf'
+      )
+    ORDER BY
+      CASE
+        WHEN code = 'patient_ehr_v2' THEN 0
+        WHEN code = 'patient_ehr_v2_crf' THEN 1
+        WHEN schema_type = 'crf' THEN 2
+        ELSE 3
+      END,
+      version DESC
     LIMIT 1
   `).get() as any
 }
@@ -473,12 +485,27 @@ router.post('/:patientId/ehr-folder/update', async (req: Request, res: Response)
         `[update-ehr-folder] 开始提交抽取任务 patient=${patientId} schema=${schemaRow.id} document_count=${documentIdsToExtract.length}`
       )
 
-      const response = await crfServiceSubmitBatch({
-        patient_id: patientId,
-        schema_id: schemaRow.id,
-        document_ids: documentIdsToExtract,
-        instance_type: 'patient_ehr'
-      })
+      let response: Awaited<ReturnType<typeof crfServiceSubmitBatch>>
+      try {
+        response = await crfServiceSubmitBatch({
+          patient_id: patientId,
+          schema_id: schemaRow.id,
+          document_ids: documentIdsToExtract,
+          instance_type: 'patient_ehr'
+        })
+      } catch (submitErr: any) {
+        const message = `CRF 服务不可用，无法提交抽取任务：${submitErr?.message || '连接失败'}`
+        console.error(`[update-ehr-folder] ${message} url=${CRF_SERVICE_URL}`)
+        return res.status(502).json({
+          success: false,
+          code: 502,
+          message,
+          data: {
+            crf_service_url: CRF_SERVICE_URL,
+            submitted_document_count: 0,
+          }
+        })
+      }
 
       if (!response.ok) {
         const errorText = await response.text()

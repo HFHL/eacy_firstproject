@@ -32,6 +32,7 @@ CREATE TABLE IF NOT EXISTS schema_instances (
   id             TEXT PRIMARY KEY,
   schema_id      TEXT NOT NULL REFERENCES schemas(id),
   patient_id     TEXT NOT NULL REFERENCES patients(id),
+  project_id     TEXT REFERENCES projects(id) ON DELETE CASCADE,
   instance_type  TEXT NOT NULL DEFAULT 'patient_ehr',     -- patient_ehr / crf
   name           TEXT,                                    -- 实例名称
   status         TEXT NOT NULL DEFAULT 'draft',           -- draft / in_progress / completed / locked
@@ -41,6 +42,7 @@ CREATE TABLE IF NOT EXISTS schema_instances (
 
 CREATE INDEX IF NOT EXISTS idx_si_patient  ON schema_instances(patient_id);
 CREATE INDEX IF NOT EXISTS idx_si_schema   ON schema_instances(schema_id);
+CREATE INDEX IF NOT EXISTS idx_si_project  ON schema_instances(project_id);
 CREATE INDEX IF NOT EXISTS idx_si_type     ON schema_instances(instance_type);
 
 -- --------------------------------------------------------

@@ -13,9 +13,13 @@
  */
 import { Router, Request, Response } from 'express'
 import db from '../db.js'
-import { CRF_SERVICE_URL } from '../services/crfServiceClient.js'
+import { CRF_SERVICE_URL, crfServiceSubmitBatch } from '../services/crfServiceClient.js'
 
 const router = Router()
+
+function nowIso() {
+  return new Date().toISOString()
+}
 
 // ─── JSON 解析工具 ───────────────────────────────────────────────────────────
 
@@ -40,6 +44,18 @@ function parseJsonObject(raw: unknown): Record<string, any> {
     return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : {}
   } catch {
     return {}
+  }
+}
+
+function parseJsonValue(raw: unknown): unknown {
+  if (raw == null) return null
+  if (typeof raw !== 'string') return raw
+  const trimmed = raw.trim()
+  if (!trimmed) return null
+  try {
+    return JSON.parse(trimmed)
+  } catch {
+    return raw
   }
 }
 
@@ -179,6 +195,8 @@ function summarizeJobRow(jobRow: any): UnifiedTask {
   let targetSection: string | null = null
   if (jobRow.run_target_mode === 'targeted_section' && jobRow.run_target_path) {
     targetSection = String(jobRow.run_target_path)
+  } else if (typeof jobRow.job_type === 'string' && jobRow.job_type.startsWith('extract:target:')) {
+    targetSection = jobRow.job_type.slice('extract:target:'.length).trim() || null
   } else if (jobRow.doc_metadata) {
     const meta = parseJsonObject(jobRow.doc_metadata)
     const ts = meta.target_section
@@ -251,6 +269,42 @@ function summarizeJobRow(jobRow: any): UnifiedTask {
   }
 }
 
+function enrichJobRowsWithLatestRun(jobRows: any[]): any[] {
+  const instanceIds = Array.from(new Set(
+    jobRows
+      .map((row) => String(row.result_extraction_run_id || ''))
+      .filter((id) => id.startsWith('si_'))
+  ))
+  if (instanceIds.length === 0) return jobRows
+
+  const runRows = db.prepare(`
+    SELECT er.instance_id, er.document_id, er.target_mode, er.target_path,
+           er.model_name, er.prompt_version, er.created_at
+    FROM extraction_runs er
+    WHERE er.instance_id IN (${instanceIds.map(() => '?').join(',')})
+    ORDER BY er.created_at DESC
+  `).all(...instanceIds) as any[]
+
+  const runMap = new Map<string, any>()
+  for (const run of runRows) {
+    const key = `${run.instance_id}:${run.document_id || ''}`
+    if (!runMap.has(key)) runMap.set(key, run)
+  }
+
+  return jobRows.map((row) => {
+    if (row.run_target_mode || row.run_target_path) return row
+    const run = runMap.get(`${row.result_extraction_run_id || ''}:${row.document_id || ''}`)
+    if (!run) return row
+    return {
+      ...row,
+      run_target_mode: run.target_mode,
+      run_target_path: run.target_path,
+      run_model_name: run.model_name,
+      run_prompt_version: run.prompt_version,
+    }
+  })
+}
+
 // ─── 路由 ───────────────────────────────────────────────────────────────────
 
 /**
@@ -313,15 +367,18 @@ router.get('/extraction-tasks', (req: Request, res: Response) => {
       LEFT JOIN schemas   sch ON sch.id = j.schema_id
       LEFT JOIN documents doc ON doc.id = j.document_id
       LEFT JOIN extraction_runs er ON er.id = j.result_extraction_run_id
-      WHERE j.job_type = 'extract'
+      WHERE j.job_type LIKE 'extract%'
     `).all() as any[]
 
     const standaloneJobs: UnifiedTask[] = allJobRows
       .filter((r) => !projectJobIdSet.has(String(r.id)))
+      .map((r) => r)
+
+    const standaloneTasks: UnifiedTask[] = enrichJobRowsWithLatestRun(standaloneJobs)
       .map(summarizeJobRow)
 
     // 3) 合并、筛选、排序
-    let merged: UnifiedTask[] = [...projectTasks, ...standaloneJobs]
+    let merged: UnifiedTask[] = [...projectTasks, ...standaloneTasks]
 
     if (taskTypeFilter) {
       merged = merged.filter((t) => t.task_type === taskTypeFilter)
@@ -398,6 +455,221 @@ router.get('/extraction-tasks', (req: Request, res: Response) => {
       success: false,
       code: 500,
       message: err?.message || '查询抽取任务列表失败',
+      data: null,
+    })
+  }
+})
+
+/**
+ * POST /api/v1/admin/extraction-tasks/:id/resubmit
+ *
+ * 重新投递抽取任务到 crf-service。用于处理 Celery worker 旧代码/异常退出导致的
+ * DB 仍停留 pending、但 broker 中已经没有消息的“假等待”任务，也支持 failed/cancelled
+ * 任务重新提交。
+ */
+router.post('/extraction-tasks/:id/resubmit', async (req: Request, res: Response) => {
+  try {
+    const id = req.params.id
+    const sourceHint = typeof req.body?.source === 'string' ? req.body.source : ''
+    const submittedAt = nowIso()
+
+    const projectRow = sourceHint !== 'job'
+      ? db.prepare(`SELECT * FROM project_extraction_tasks WHERE id = ?`).get(id) as any
+      : null
+
+    if (projectRow) {
+      const documentIds = normalizeStringList(parseJsonArray(projectRow.document_ids_json))
+      const oldJobIds = normalizeStringList(parseJsonArray(projectRow.job_ids_json))
+      if (documentIds.length === 0) {
+        return res.status(400).json({ success: false, code: 400, message: '该项目任务没有可重新提交的文档', data: null })
+      }
+
+      if (oldJobIds.length > 0) {
+        db.prepare(`
+          UPDATE ehr_extraction_jobs
+          SET status = 'cancelled',
+              last_error = COALESCE(last_error, '管理员重新提交项目抽取任务，旧任务已取消'),
+              completed_at = COALESCE(completed_at, ?),
+              updated_at = ?
+          WHERE id IN (${oldJobIds.map(() => '?').join(',')})
+            AND status IN ('pending', 'running')
+        `).run(submittedAt, submittedAt, ...oldJobIds)
+      }
+
+      const docRows = db.prepare(`
+        SELECT id, patient_id
+        FROM documents
+        WHERE id IN (${documentIds.map(() => '?').join(',')})
+          AND status != 'deleted'
+        ORDER BY created_at ASC
+      `).all(...documentIds) as any[]
+
+      const docsByPatient = new Map<string, string[]>()
+      for (const row of docRows) {
+        const patientId = String(row.patient_id || '')
+        if (!patientId) continue
+        const list = docsByPatient.get(patientId) || []
+        list.push(String(row.id))
+        docsByPatient.set(patientId, list)
+      }
+
+      const submittedJobIds: string[] = []
+      const submittedDocumentIds: string[] = []
+      const submittedPatientIds: string[] = []
+      const skippedPatients: any[] = []
+
+      for (const [patientId, patientDocIds] of docsByPatient.entries()) {
+        const response = await crfServiceSubmitBatch({
+          patient_id: patientId,
+          schema_id: projectRow.schema_id,
+          project_id: projectRow.project_id,
+          document_ids: patientDocIds,
+          instance_type: 'project_crf',
+        })
+
+        if (!response.ok) {
+          const errorText = await response.text()
+          return res.status(response.status).json({
+            success: false,
+            code: response.status,
+            message: errorText || '重新提交项目抽取任务失败',
+            data: null,
+          })
+        }
+
+        const result = await response.json()
+        const jobs = Array.isArray(result?.jobs) ? result.jobs : []
+        const jobIds = normalizeStringList(jobs.map((job: any) => job?.job_id))
+        if (jobIds.length === 0) {
+          skippedPatients.push({ patient_id: patientId, reason: 'no_new_jobs' })
+          continue
+        }
+        submittedPatientIds.push(patientId)
+        submittedJobIds.push(...jobIds)
+        submittedDocumentIds.push(...patientDocIds)
+      }
+
+      if (submittedJobIds.length === 0) {
+        return res.status(409).json({
+          success: false,
+          code: 409,
+          message: '没有可重新提交的任务；可能所有文档已有活跃任务',
+          data: { skipped_patients: skippedPatients },
+        })
+      }
+
+      const summary = parseJsonObject(projectRow.summary_json)
+      db.prepare(`
+        UPDATE project_extraction_tasks
+        SET status = 'running',
+            job_ids_json = ?,
+            patient_ids_json = ?,
+            document_ids_json = ?,
+            summary_json = ?,
+            started_at = ?,
+            finished_at = NULL,
+            cancelled_at = NULL,
+            updated_at = ?
+        WHERE id = ?
+      `).run(
+        JSON.stringify(submittedJobIds),
+        JSON.stringify(submittedPatientIds),
+        JSON.stringify(submittedDocumentIds),
+        JSON.stringify({
+          ...summary,
+          resubmitted_at: submittedAt,
+          resubmitted_from_task_id: projectRow.id,
+          cancelled_old_job_ids: oldJobIds,
+          resubmitted_job_count: submittedJobIds.length,
+          skipped_patients: skippedPatients,
+        }),
+        submittedAt,
+        submittedAt,
+        id,
+      )
+
+      return res.json({
+        success: true,
+        code: 0,
+        message: `已重新提交 ${submittedJobIds.length} 个项目抽取任务`,
+        data: {
+          task_id: id,
+          job_ids: submittedJobIds,
+          submitted_patient_count: submittedPatientIds.length,
+          submitted_document_count: submittedDocumentIds.length,
+          skipped_patients: skippedPatients,
+        },
+      })
+    }
+
+    const jobRow = sourceHint !== 'project'
+      ? db.prepare(`
+          SELECT j.*, doc.metadata AS doc_metadata
+          FROM ehr_extraction_jobs j
+          LEFT JOIN documents doc ON doc.id = j.document_id
+          WHERE j.id = ?
+        `).get(id) as any
+      : null
+
+    if (!jobRow) {
+      return res.status(404).json({ success: false, code: 404, message: '未找到可重新提交的抽取任务', data: null })
+    }
+
+    if (jobRow.status === 'running') {
+      return res.status(409).json({ success: false, code: 409, message: '任务正在运行中，无需重新提交', data: null })
+    }
+
+    const docMeta = parseJsonObject(jobRow.doc_metadata)
+    const targetSection = typeof docMeta.target_section === 'string' && docMeta.target_section.trim()
+      ? docMeta.target_section.trim()
+      : undefined
+
+    const response = await crfServiceSubmitBatch({
+      patient_id: jobRow.patient_id,
+      schema_id: jobRow.schema_id,
+      document_ids: [jobRow.document_id],
+      instance_type: targetSection ? 'patient_ehr' : 'patient_ehr',
+      target_section: targetSection,
+    })
+
+    if (!response.ok) {
+      const errorText = await response.text()
+      return res.status(response.status).json({
+        success: false,
+        code: response.status,
+        message: errorText || '重新提交抽取任务失败',
+        data: null,
+      })
+    }
+
+    const result = await response.json()
+    const jobs = Array.isArray(result?.jobs) ? result.jobs : []
+    const newJobId = jobs[0]?.job_id || null
+    if (!newJobId) {
+      return res.status(409).json({
+        success: false,
+        code: 409,
+        message: '没有创建或复用到可投递的任务',
+        data: result,
+      })
+    }
+
+    return res.json({
+      success: true,
+      code: 0,
+      message: newJobId === id ? '已重新投递当前任务' : '已创建并提交新的抽取任务',
+      data: {
+        task_id: newJobId,
+        original_task_id: id,
+        job_ids: [newJobId],
+      },
+    })
+  } catch (err: any) {
+    console.error('[admin/extraction-tasks/:id/resubmit] error:', err)
+    return res.status(500).json({
+      success: false,
+      code: 500,
+      message: err?.message || '重新提交抽取任务失败',
       data: null,
     })
   }
@@ -507,6 +779,19 @@ interface ExtractionRunDetail {
   error_message: string | null
   field_candidate_count: number
   field_with_evidence_count: number
+  extracted_fields: ExtractedFieldDetail[]
+}
+
+interface ExtractedFieldDetail {
+  id: string
+  field_path: string
+  value: unknown
+  source_text: string | null
+  source_document_id: string | null
+  source_document_name: string | null
+  source_page: number | null
+  confidence: number | null
+  created_at: string | null
 }
 
 function buildJobDetails(jobRows: any[]): JobDetail[] {
@@ -578,6 +863,7 @@ function buildJobDetails(jobRows: any[]): JobDetail[] {
       Array.from(runMap.values()).map((r: any) => String(r.id)).filter(Boolean)
     ))
     const statsMap = new Map<string, { total: number; with_evidence: number }>()
+    const fieldsMap = new Map<string, ExtractedFieldDetail[]>()
     if (chosenRunIds.length > 0) {
       const statsRows = db.prepare(`
         SELECT extraction_run_id,
@@ -592,6 +878,33 @@ function buildJobDetails(jobRows: any[]): JobDetail[] {
           total: Number(r.field_total) || 0,
           with_evidence: Number(r.with_evidence) || 0,
         })
+      }
+
+      const fieldRows = db.prepare(`
+        SELECT fvc.id, fvc.extraction_run_id, fvc.field_path, fvc.value_json,
+               fvc.source_text, fvc.source_document_id, fvc.source_page,
+               fvc.confidence, fvc.created_at, d.file_name AS source_document_name
+        FROM field_value_candidates fvc
+        LEFT JOIN documents d ON d.id = fvc.source_document_id
+        WHERE fvc.extraction_run_id IN (${chosenRunIds.map(() => '?').join(',')})
+        ORDER BY fvc.extraction_run_id, fvc.created_at ASC, fvc.field_path ASC
+      `).all(...chosenRunIds) as any[]
+      for (const r of fieldRows) {
+        const key = String(r.extraction_run_id)
+        const list = fieldsMap.get(key) || []
+        if (list.length >= 80) continue
+        list.push({
+          id: String(r.id),
+          field_path: String(r.field_path || ''),
+          value: parseJsonValue(r.value_json),
+          source_text: r.source_text || null,
+          source_document_id: r.source_document_id || null,
+          source_document_name: r.source_document_name || null,
+          source_page: r.source_page == null ? null : Number(r.source_page),
+          confidence: r.confidence == null ? null : Number(r.confidence),
+          created_at: r.created_at || null,
+        })
+        fieldsMap.set(key, list)
       }
     }
 
@@ -612,6 +925,7 @@ function buildJobDetails(jobRows: any[]): JobDetail[] {
         error_message: r.error_message || null,
         field_candidate_count: stat.total,
         field_with_evidence_count: stat.with_evidence,
+        extracted_fields: fieldsMap.get(String(r.id)) || [],
       })
     }
     // 把 runMap 替换掉，后面 jobs 映射用 detailMap

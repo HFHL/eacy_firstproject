@@ -32,6 +32,7 @@ import { getProjectTemplate } from '../../api/crfTemplate'
 import { resolveTemplateAssets } from '../../utils/templateAssetResolver'
 import { appThemeToken } from '../../styles/themeTokens'
 import { normalizeTemplateFieldGroups } from './config/datasetContract'
+import { deriveTemplateFieldGroupsFromSchema } from './adapters/datasetAdapter'
 
 // 导入数据 Hook
 import useProjectPatientData from './hooks/useProjectPatientData'
@@ -410,6 +411,33 @@ function hasEffectiveValue(value) {
 }
 
 /**
+ * 判断某个 schema 路径上是否已经存在可重复表单数组。
+ * 后端已经从 section_instances 按 repeat_index 重建了 crf_data.data；这些数组是权威结构，
+ * 不能再被兼容用的 groups.fields 扁平/数组字段二次合并污染。
+ * @param {Object|null} schemaRoot
+ * @param {Object} data
+ * @param {string[]} parts
+ * @returns {boolean}
+ */
+function hasExistingRepeatableArrayAtOrAbove(schemaRoot, data, parts) {
+  if (!schemaRoot || typeof schemaRoot !== 'object' || !Array.isArray(parts) || parts.length === 0) return false
+
+  let schemaNode = schemaRoot
+  let valueNode = data
+  for (const part of parts) {
+    if (!schemaNode || typeof schemaNode !== 'object') return false
+    if (schemaNode.type === 'array') {
+      return Array.isArray(valueNode) && hasEffectiveValue(valueNode)
+    }
+    if (schemaNode.type !== 'object' || !schemaNode.properties?.[part]) return false
+    schemaNode = schemaNode.properties[part]
+    valueNode = valueNode?.[part]
+  }
+
+  return schemaNode?.type === 'array' && Array.isArray(valueNode) && hasEffectiveValue(valueNode)
+}
+
+/**
  * 解析最合适的 schema 写入路径，兼容“字段仅存局部路径”与“组名前缀缺失”场景。
  *
  * @param {Object|null} schemaRoot schema 根节点。
@@ -494,6 +522,7 @@ function mergeGroupValuesIntoDataByTemplate(baseData, schemaRoot, groups, templa
         rawFieldData.value,
       )
       if (!resolvedParts) return
+      if (hasExistingRepeatableArrayAtOrAbove(schemaRoot, nextData, resolvedParts)) return
       const existingValue = readValueBySchema(nextData, schemaRoot, resolvedParts)
       // 已有非空结构时不覆盖，防止重复写入时破坏既有对象。
       if (hasEffectiveValue(existingValue)) return
@@ -510,6 +539,7 @@ function mergeGroupValuesIntoDataByTemplate(baseData, schemaRoot, groups, templa
       if (parts.length === 0) return
       const existingValue = readValueBySchema(nextData, schemaRoot, parts)
       if (hasEffectiveValue(existingValue)) return
+      if (hasExistingRepeatableArrayAtOrAbove(schemaRoot, nextData, parts)) return
       const fieldValue = readGroupFieldValueByPath(groupFields, normalizedPath, templateGroup?.name || groupNode?.group_name || '')
       if (fieldValue === undefined) return
       const mergedValue = buildValueBySchema(nextData, schemaRoot, parts, fieldValue)
@@ -533,6 +563,7 @@ function mergeGroupValuesIntoDataByTemplate(baseData, schemaRoot, groups, templa
         fieldData.value,
       )
       if (!resolvedParts) return
+      if (hasExistingRepeatableArrayAtOrAbove(schemaRoot, nextData, resolvedParts)) return
       const mergedValue = buildValueBySchema(nextData, schemaRoot, resolvedParts, fieldData.value)
       if (mergedValue !== undefined) Object.assign(nextData, mergedValue)
     })
@@ -657,11 +688,15 @@ const ProjectPatientDetail = () => {
         const response = await getProjectTemplate(projectId)
         const template = response?.data
         const { schema } = resolveTemplateAssets(template)
-        const normalizedTemplateGroups = normalizeTemplateFieldGroups(
+        const normalizedGroups = normalizeTemplateFieldGroups(
           template?.field_groups
             || template?.template_info?.field_groups
             || template?.layout_config?.field_groups
             || [],
+        )
+        const normalizedTemplateGroups = (normalizedGroups.length > 0
+          ? normalizedGroups
+          : deriveTemplateFieldGroupsFromSchema(schema)
         ).map((group) => ({
           key: group.group_id,
           name: group.group_name,

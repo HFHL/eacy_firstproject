@@ -106,6 +106,10 @@ app.add_middleware(
 class ExtractRequest(BaseModel):
     patient_id: str = Field(..., description="患者 ID")
     schema_id: str = Field(..., description="Schema ID 或 code")
+    project_id: Optional[str] = Field(
+        default=None,
+        description="科研项目 ID；instance_type=project_crf 时用于隔离同一患者在不同项目中的 CRF 实例",
+    )
     document_ids: Optional[List[str]] = Field(
         default=None,
         description="可选：指定文档 ID 列表。不指定则按患者名下文档自动匹配",
@@ -204,6 +208,7 @@ async def submit_extraction(req: ExtractRequest):
         schema_id=actual_schema_id,
         document_ids=req.document_ids,
         instance_type=req.instance_type,
+        project_id=req.project_id,
         target_section=req.target_section,
     )
 
@@ -309,6 +314,10 @@ async def extraction_progress_sse(job_id: str):
 class BatchExtractRequest(BaseModel):
     patient_id: str
     schema_id: str
+    project_id: Optional[str] = Field(
+        default=None,
+        description="科研项目 ID；instance_type=project_crf 时用于项目级实例隔离",
+    )
     document_ids: List[str] = Field(..., description="归档的文档 ID 列表")
     instance_type: str = "patient_ehr"
     target_section: Optional[str] = Field(
@@ -316,6 +325,10 @@ class BatchExtractRequest(BaseModel):
         description=(
             "可选：靶向 section 名。若提供则进入靶向模式（绕过 x-sources 子类型匹配）"
         ),
+    )
+    target_sections: Optional[List[str]] = Field(
+        default=None,
+        description="可选：多个靶向 section 名。用于科研专项抽取一次提交多个字段组",
     )
 
 
@@ -336,11 +349,12 @@ async def submit_batch_extraction(req: BatchExtractRequest):
         actual_schema_id = schema_rec["id"]
 
         for doc_id in req.document_ids:
+            job_type = f"extract:target:{req.target_section}" if req.target_section else "extract"
             job_id = repo.create_job(
                 conn,
                 document_id=doc_id,
                 schema_id=actual_schema_id,
-                job_type="extract",
+                job_type=job_type,
                 patient_id=req.patient_id,
             )
             if job_id:
@@ -365,7 +379,9 @@ async def submit_batch_extraction(req: BatchExtractRequest):
         schema_id=actual_schema_id,
         document_ids=all_doc_ids,
         instance_type=req.instance_type,
+        project_id=req.project_id,
         target_section=req.target_section,
+        target_sections=req.target_sections,
     )
 
     return {

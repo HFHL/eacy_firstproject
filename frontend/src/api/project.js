@@ -148,9 +148,35 @@ export const removeProjectPatient = async (projectId, patientId) => {
 const ok = (data = null, message = '本地模式') =>
   Promise.resolve({ success: true, code: 0, message, data })
 
-export const updateProject = (projectId, data) => ok({ id: projectId, ...(data || {}) })
-export const deleteProject = () => ok({})
-export const toggleProjectStatus = () => ok({})
+export const updateProject = async (projectId, data = {}) => {
+  if (!projectId) return { success: false, code: 400, message: '缺少项目 id', data: null }
+  try {
+    const response = await fetch(`${API_BASE}/${encodeURIComponent(projectId)}`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(data || {}),
+    })
+    return await parseJsonResponse(response)
+  } catch (e) {
+    console.error('updateProject:', e)
+    return { success: false, code: 500, message: e.message, data: null }
+  }
+}
+
+export const deleteProject = async (projectId) => {
+  if (!projectId) return { success: false, code: 400, message: '缺少项目 id', data: null }
+  try {
+    const response = await fetch(`${API_BASE}/${encodeURIComponent(projectId)}`, {
+      method: 'DELETE',
+    })
+    return await parseJsonResponse(response)
+  } catch (e) {
+    console.error('deleteProject:', e)
+    return { success: false, code: 500, message: e.message, data: null }
+  }
+}
+
+export const toggleProjectStatus = (projectId, status) => updateProject(projectId, { status })
 export const getProjectMembers = () => ok([])
 export const addProjectMember = () => ok({})
 export const removeProjectMember = () => ok({})
@@ -166,7 +192,23 @@ export const getProjectPatientDetail = async (projectId, patientId) => {
     return { success: false, code: 500, message: e.message, data: null }
   }
 }
-export const updateProjectPatientCrfFields = () => ok({})
+export const updateProjectPatientCrfFields = async (projectId, patientId, fields = []) => {
+  if (!projectId || !patientId) return { success: false, code: 400, message: '缺少项目 id 或患者 id', data: null }
+  try {
+    const response = await fetch(
+      `${API_BASE}/${encodeURIComponent(projectId)}/patients/${encodeURIComponent(patientId)}/crf/fields`,
+      {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ fields: Array.isArray(fields) ? fields : [] }),
+      }
+    )
+    return await parseJsonResponse(response)
+  } catch (e) {
+    console.error('updateProjectPatientCrfFields:', e)
+    return { success: false, code: 500, message: e.message, data: null }
+  }
+}
 export const getProjectPatientCrfConflicts = () => ok([])
 export const resolveProjectPatientCrfConflict = () => ok({})
 export const resolveAllProjectPatientCrfConflicts = () => ok({})

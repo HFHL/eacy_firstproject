@@ -304,10 +304,17 @@ export const extractEhrData = (documentId, options = {}) => {
  * @param {string} targetSection - 靶向字段组路径（如 "基本信息.人口学情况"）
  * @returns {Promise} 抽取结果
  */
-export const extractEhrDataTargeted = (documentId, patientId, targetSection) => {
-  return request.post(`/documents/${documentId}/extract-ehr`, {
+export const extractEhrDataTargeted = (documentId, patientId, targetSection, options = {}) => {
+  const { projectId = null, schemaId = null, instanceType = null } = options
+  const payload = {
     patient_id: patientId,
     target_section: targetSection,
+  }
+  if (projectId) payload.project_id = projectId
+  if (schemaId) payload.schema_id = schemaId
+  if (instanceType) payload.instance_type = instanceType
+  return request.post(`/documents/${documentId}/extract-ehr`, {
+    ...payload,
   }, {
     timeout: 120000,
   })

@@ -15,7 +15,7 @@ import {
   getAdminUsers, getAdminProjects, getAdminTemplates,
   getAdminDocuments, getAdminStats, getAdminActiveTasks,
   getProjectExtractionTasks, getAdminExtractionTasks,
-  getAdminExtractionTaskDetail
+  getAdminExtractionTaskDetail, resubmitAdminExtractionTask
 } from '../../api/admin'
 import { appThemeToken } from '../../styles/themeTokens'
 import { useExtractionProgressSSE } from '../../hooks'
@@ -437,6 +437,71 @@ const ExtractionProgressStream = ({ events, status, terminal, error }) => {
   )
 }
 
+const formatExtractedValue = (value) => {
+  if (value == null || value === '') return '—'
+  if (typeof value === 'string') return value
+  try { return JSON.stringify(value, null, 2) } catch { return String(value) }
+}
+
+const ExtractedFieldsTable = ({ fields = [] }) => {
+  if (!fields.length) {
+    return (
+      <Alert
+        type="info"
+        showIcon
+        message="该 Job 暂无可展示的抽取字段"
+        description="可能尚未物化成功，或该文档没有命中可抽取字段。"
+      />
+    )
+  }
+  return (
+    <Table
+      size="small"
+      rowKey="id"
+      pagination={{ pageSize: 10, size: 'small' }}
+      dataSource={fields}
+      columns={[
+        {
+          title: '字段路径',
+          dataIndex: 'field_path',
+          key: 'field_path',
+          width: 260,
+          ellipsis: { showTitle: false },
+          render: (v) => <Tooltip title={v}><Text code style={{ fontSize: 12 }}>{v || '-'}</Text></Tooltip>,
+        },
+        {
+          title: '抽取值',
+          dataIndex: 'value',
+          key: 'value',
+          width: 260,
+          render: (v) => {
+            const text = formatExtractedValue(v)
+            return <Tooltip title={<pre style={{ margin: 0, whiteSpace: 'pre-wrap' }}>{text}</pre>}><Text>{text.length > 80 ? `${text.slice(0, 80)}…` : text}</Text></Tooltip>
+          },
+        },
+        {
+          title: '证据原文',
+          dataIndex: 'source_text',
+          key: 'source_text',
+          ellipsis: { showTitle: false },
+          render: (v) => v ? <Tooltip title={v}><Text type="secondary">{v}</Text></Tooltip> : <Text type="secondary">—</Text>,
+        },
+        {
+          title: '来源',
+          key: 'source',
+          width: 180,
+          render: (_, r) => (
+            <Space direction="vertical" size={0} style={{ lineHeight: 1.3 }}>
+              <Text type="secondary" style={{ fontSize: 12 }}>{r.source_document_name || r.source_document_id || '-'}</Text>
+              <Text type="secondary" style={{ fontSize: 12 }}>页 {r.source_page ?? '-'}</Text>
+            </Space>
+          ),
+        },
+      ]}
+    />
+  )
+}
+
 const ExtractionTaskDetailModal = ({ open, taskId, onClose }) => {
   const [detail, setDetail] = useState(null)
   const [loading, setLoading] = useState(false)
@@ -670,6 +735,10 @@ const ExtractionTaskDetailModal = ({ open, taskId, onClose }) => {
             rowKey="id"
             size="small"
             pagination={false}
+            expandable={{
+              expandedRowRender: (r) => <ExtractedFieldsTable fields={r.extraction_run?.extracted_fields || []} />,
+              rowExpandable: (r) => !!r.extraction_run,
+            }}
             scroll={{ x: 1000, y: 360 }}
           />
 
@@ -707,6 +776,7 @@ const ExtractionTasksTab = () => {
   const [statusFilter, setStatusFilter] = useState('all')
   const [search, setSearch] = useState('')
   const [detailId, setDetailId] = useState(null)
+  const [resubmittingId, setResubmittingId] = useState(null)
 
   const fetchTasks = useCallback(async () => {
     setLoading(true)
@@ -768,6 +838,27 @@ const ExtractionTasksTab = () => {
         {meta.label}
       </Tag>
     )
+  }
+
+  const handleResubmit = (record) => {
+    Modal.confirm({
+      title: '确认重新提交抽取任务？',
+      content: '系统会重新投递该任务到 CRF Worker。若旧任务是假等待/失败，可用此操作恢复执行。',
+      okText: '重新提交',
+      cancelText: '取消',
+      onOk: async () => {
+        setResubmittingId(record.id)
+        try {
+          const res = await resubmitAdminExtractionTask(record.id, {
+            source: record.source_table === 'project_extraction_tasks' ? 'project' : 'job',
+          })
+          message.success(res?.message || '已重新提交抽取任务')
+          await fetchTasks()
+        } finally {
+          setResubmittingId(null)
+        }
+      },
+    })
   }
 
   const columns = [
@@ -903,13 +994,27 @@ const ExtractionTasksTab = () => {
     {
       title: '操作',
       key: 'actions',
-      width: 100,
+      width: 170,
       fixed: 'right',
-      render: (_, r) => (
-        <Button size="small" type="link" onClick={() => setDetailId(r.id)}>
-          详情
-        </Button>
-      ),
+      render: (_, r) => {
+        const canResubmit = ['pending', 'failed', 'cancelled'].includes(r.status)
+        return (
+          <Space size={4}>
+            <Button size="small" type="link" onClick={() => setDetailId(r.id)}>
+              详情
+            </Button>
+            <Button
+              size="small"
+              type="link"
+              disabled={!canResubmit}
+              loading={resubmittingId === r.id}
+              onClick={() => handleResubmit(r)}
+            >
+              重新提交
+            </Button>
+          </Space>
+        )
+      },
     },
   ]
 

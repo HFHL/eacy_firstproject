@@ -37,3 +37,7 @@ export const getAdminExtractionTasks = (params = {}) => {
 export const getAdminExtractionTaskDetail = (id, params = {}) => {
   return request.get(`/admin/extraction-tasks/${id}`, { params, ...silentConfig })
 }
+
+export const resubmitAdminExtractionTask = (id, data = {}) => {
+  return request.post(`/admin/extraction-tasks/${id}/resubmit`, data)
+}

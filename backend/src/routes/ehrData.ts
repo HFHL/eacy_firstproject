@@ -76,6 +76,10 @@ function buildCandidateFieldPaths(rawFieldPath: string): string[] {
   return [...new Set(pathsToTry)]
 }
 
+function normalizeScopePath(rawPath: string): string {
+  return normalizeRequestFieldPath(rawPath)
+}
+
 function buildSelectableCandidateFieldPaths(rawFieldPath: string): string[] {
   const fieldPath = normalizeRequestFieldPath(rawFieldPath)
   const pathsToTry: string[] = [fieldPath]
@@ -97,30 +101,105 @@ function buildFieldPathSuffixes(paths: string[]): string[] {
   return [...new Set(suffixes)]
 }
 
-function resolveSelectedPosition(instanceId: string, rawFieldPath: string) {
-  const uniquePaths = buildCandidateFieldPaths(rawFieldPath)
-  const placeholders = uniquePaths.map(() => '?').join(',')
-  if (!placeholders) {
-    return { sectionInstanceId: null, rowInstanceId: null }
+interface ResolvedScope {
+  sectionInstanceId: string | null
+  rowInstanceId: string | null
+  hasIndices: boolean
+  resolved: boolean
+}
+
+/**
+ * 根据请求路径中的索引段，定位唯一的 (section_instance_id, row_instance_id)。
+ *
+ * 物化侧的约定（crf-service/app/core/materializer.py）：
+ *   - 可重复 section 的 idx 会被保留在其后代的 current_path 中
+ *     → row_instances.group_path 会包含祖先的 section idx（如 /实验室检查/传染学检测/0/检验结果）
+ *   - 可重复 row 的 idx 不会进入后代 path，只通过 row_instances.repeat_index 区分
+ *   - field_value_candidates.field_path 一律用 _normalize_field_path 剥掉所有数字段
+ *
+ * 逆向解析规则：逐段前进，遇到数字段时先尝试匹配 row_instances（不把该 idx 追加到累积路径），
+ * 再退化到 section_instances（把 idx 追加到累积路径，供后续 group_path 拼接）。
+ */
+function resolveScopeFromPath(instanceId: string, rawPath: string): ResolvedScope {
+  const normalizedPath = normalizeScopePath(rawPath)
+  const segments = normalizedPath.split('/').filter(Boolean)
+  const hasIndices = segments.some((s) => /^\d+$/.test(s))
+  if (!hasIndices) {
+    return { sectionInstanceId: null, rowInstanceId: null, hasIndices: false, resolved: true }
   }
 
-  const existing = db.prepare(`
-    SELECT section_instance_id, row_instance_id
-    FROM field_value_selected
-    WHERE instance_id = ? AND field_path IN (${placeholders})
-    ORDER BY
-      CASE WHEN section_instance_id IS NOT NULL OR row_instance_id IS NOT NULL THEN 0 ELSE 1 END,
-      updated_at DESC,
-      selected_at DESC
-    LIMIT 1
-  `).get(instanceId, ...uniquePaths) as
-    | { section_instance_id: string | null; row_instance_id: string | null }
-    | undefined
+  let sectionInstanceId: string | null = null
+  let rowInstanceId: string | null = null
+  let parentSectionId: string | null = null
+  let parentRowId: string | null = null
+  const cumulative: string[] = []
 
-  return {
-    sectionInstanceId: existing?.section_instance_id || null,
-    rowInstanceId: existing?.row_instance_id || null,
+  for (const seg of segments) {
+    if (!/^\d+$/.test(seg)) {
+      cumulative.push(seg)
+      continue
+    }
+
+    const idx = Number(seg)
+    const groupPath = '/' + cumulative.join('/')
+
+    const row = db.prepare(`
+      SELECT id FROM row_instances
+      WHERE instance_id = ? AND group_path = ? AND repeat_index = ?
+        AND COALESCE(parent_row_id, '__null__') = COALESCE(?, '__null__')
+      LIMIT 1
+    `).get(instanceId, groupPath, idx, parentRowId) as { id: string } | undefined
+
+    if (row) {
+      parentRowId = row.id
+      rowInstanceId = row.id
+      continue
+    }
+
+    const sectionPath = '/' + cumulative.filter((s) => !/^\d+$/.test(s)).join('/')
+    const section = db.prepare(`
+      SELECT id FROM section_instances
+      WHERE instance_id = ? AND section_path = ? AND repeat_index = ?
+        AND COALESCE(parent_section_id, '__null__') = COALESCE(?, '__null__')
+      LIMIT 1
+    `).get(instanceId, sectionPath, idx, parentSectionId) as { id: string } | undefined
+
+    if (section) {
+      parentSectionId = section.id
+      sectionInstanceId = section.id
+      cumulative.push(seg)
+      continue
+    }
+
+    return { sectionInstanceId, rowInstanceId, hasIndices: true, resolved: false }
   }
+
+  return { sectionInstanceId, rowInstanceId, hasIndices: true, resolved: true }
+}
+
+/**
+ * 将 ResolvedScope 转换为 SQL WHERE 片段 + 参数列表，供 field_value_candidates /
+ * field_value_selected 查询附加使用。
+ *   - 无索引路径：不加过滤（向后兼容 "查所有行" 的语义）
+ *   - 有索引但解析失败：返回 "1=0"，避免跨行串台
+ *   - 解析成功：按 row_instance_id / section_instance_id 精确定位
+ */
+function buildScopeWhereClause(scope: ResolvedScope, alias: string): { sql: string; params: any[] } {
+  if (!scope.hasIndices) return { sql: '', params: [] }
+  if (!scope.resolved) return { sql: 'AND 1 = 0', params: [] }
+  const clauses: string[] = []
+  const params: any[] = []
+  if (scope.rowInstanceId) {
+    clauses.push(`${alias}.row_instance_id = ?`)
+    params.push(scope.rowInstanceId)
+  } else {
+    clauses.push(`${alias}.row_instance_id IS NULL`)
+  }
+  if (scope.sectionInstanceId) {
+    clauses.push(`${alias}.section_instance_id = ?`)
+    params.push(scope.sectionInstanceId)
+  }
+  return { sql: 'AND ' + clauses.join(' AND '), params }
 }
 
 /**
@@ -220,9 +299,13 @@ router.get('/:patientId/ehr-schema-data', (req: Request, res: Response) => {
 
     const selectedByPath = new Map<string, any>()
     for (const row of rawSelectedRows) {
-      const existing = selectedByPath.get(row.field_path)
+      const hasRowScope = !!row.section_instance_id || !!row.row_instance_id
+      const dedupeKey = hasRowScope
+        ? [row.section_instance_id || '', row.row_instance_id || '', row.field_path || ''].join('::')
+        : String(row.field_path || '')
+      const existing = selectedByPath.get(dedupeKey)
       if (!existing || String(row.updated_at || '') >= String(existing.updated_at || '')) {
-        selectedByPath.set(row.field_path, row)
+        selectedByPath.set(dedupeKey, row)
       }
     }
     const selectedRows = Array.from(selectedByPath.values())
@@ -499,9 +582,9 @@ router.get('/:patientId/ehr-field-history', (req: Request, res: Response) => {
       if (proj?.schema_id) {
         instance = db.prepare(`
           SELECT id FROM schema_instances
-          WHERE patient_id = ? AND schema_id = ? AND instance_type = 'project_crf'
+          WHERE patient_id = ? AND schema_id = ? AND project_id = ? AND instance_type = 'project_crf'
           ORDER BY updated_at DESC LIMIT 1
-        `).get(patientId, proj.schema_id) as { id: string } | undefined
+        `).get(patientId, proj.schema_id, projectIdParam) as { id: string } | undefined
       }
     } else {
       instance = db.prepare(`
@@ -525,6 +608,8 @@ router.get('/:patientId/ehr-field-history', (req: Request, res: Response) => {
     const placeholders = uniquePaths.map(() => '?').join(',')
     const suffixClauses = suffixPaths.map(() => `fvc.field_path LIKE ?`).join(' OR ')
     const suffixParams = suffixPaths.map((suffix) => `%${suffix}`)
+    const historyScope = resolveScopeFromPath(instance.id, rawFieldPath)
+    const historyScopeClause = buildScopeWhereClause(historyScope, 'fvc')
     const candidates = db.prepare(`
       SELECT
         fvc.id,
@@ -553,10 +638,11 @@ router.get('/:patientId/ehr-field-history', (req: Request, res: Response) => {
           fvc.field_path IN (${placeholders})
           ${suffixClauses ? `OR ${suffixClauses}` : ''}
         )
+        ${historyScopeClause.sql}
       ORDER BY
         CASE WHEN fvc.field_path IN (${placeholders}) THEN 0 ELSE 1 END,
         fvc.created_at DESC
-    `).all(instance.id, ...uniquePaths, ...suffixParams, ...uniquePaths) as any[]
+    `).all(instance.id, ...uniquePaths, ...suffixParams, ...historyScopeClause.params, ...uniquePaths) as any[]
 
     // Transform into the format the ModificationHistory component expects
     const history = candidates.map((c, idx) => {
@@ -604,28 +690,7 @@ router.get('/:patientId/ehr-field-history', (req: Request, res: Response) => {
         source_page: c.source_page,
         source_text: c.source_text,
         confidence: c.confidence,
-        source_location: c.source_bbox_json ? (() => {
-          try { 
-            let parsed = JSON.parse(c.source_bbox_json)
-            // 处理 Python 端多次 json.dumps 导致的双重转义（解析出来还是字符串）
-            if (typeof parsed === 'string') {
-              try {
-                parsed = JSON.parse(parsed)
-              } catch {
-                // 如果内部不是合法 JSON，就可能是真的普通字符串
-              }
-            }
-            // 兼容数组直接作为 bbox 的情况
-            if (Array.isArray(parsed) && parsed.length >= 4) {
-              return {
-                bbox: parsed,
-                page: c.source_page !== null ? c.source_page : 1,
-                position: { x: parsed[0], y: parsed[1] }
-              }
-            }
-            return parsed
-          } catch { return null }
-        })() : null,
+        source_location: parseSourceLocation(c.source_bbox_json, c.source_page),
         remark: c.source_text || null,
         created_at: c.created_at
       }
@@ -822,10 +887,10 @@ function resolveSchemaInstance(
     return db
       .prepare(
         `SELECT id FROM schema_instances
-         WHERE patient_id = ? AND schema_id = ? AND instance_type = 'project_crf'
+         WHERE patient_id = ? AND schema_id = ? AND project_id = ? AND instance_type = 'project_crf'
          ORDER BY updated_at DESC LIMIT 1`
       )
-      .get(patientId, proj.schema_id) as { id: string } | undefined
+      .get(patientId, proj.schema_id, projectIdParam) as { id: string } | undefined
   }
   return db
     .prepare(
@@ -938,6 +1003,9 @@ router.get('/:patientId/ehr-field-candidates', (req: Request, res: Response) => 
 
     const uniquePaths = buildCandidateFieldPaths(rawFieldPath)
     const placeholders = uniquePaths.map(() => '?').join(',')
+    const scope = resolveScopeFromPath(instance.id, rawFieldPath)
+    const scopeCandidate = buildScopeWhereClause(scope, 'fvc')
+    const scopeSelected = buildScopeWhereClause(scope, 'fvs')
 
     const rows = db
       .prepare(
@@ -957,20 +1025,22 @@ router.get('/:patientId/ehr-field-candidates', (req: Request, res: Response) => 
          FROM field_value_candidates fvc
          LEFT JOIN documents d ON d.id = fvc.source_document_id
          WHERE fvc.instance_id = ? AND fvc.field_path IN (${placeholders})
+           ${scopeCandidate.sql}
          ORDER BY fvc.created_at DESC`
       )
-      .all(instance.id, ...uniquePaths) as any[]
+      .all(instance.id, ...uniquePaths, ...scopeCandidate.params) as any[]
 
     // 查每个候选路径对应的 selected 记录（取 instance 级第一条匹配）
     const selectedRow = db
       .prepare(
-        `SELECT selected_candidate_id, selected_value_json, field_path
-         FROM field_value_selected
-         WHERE instance_id = ? AND field_path IN (${placeholders})
-         ORDER BY updated_at DESC, selected_at DESC
+        `SELECT fvs.selected_candidate_id, fvs.selected_value_json, fvs.field_path
+         FROM field_value_selected fvs
+         WHERE fvs.instance_id = ? AND fvs.field_path IN (${placeholders})
+           ${scopeSelected.sql}
+         ORDER BY fvs.updated_at DESC, fvs.selected_at DESC
          LIMIT 1`
       )
-      .get(instance.id, ...uniquePaths) as
+      .get(instance.id, ...uniquePaths, ...scopeSelected.params) as
       | { selected_candidate_id: string | null; selected_value_json: string | null; field_path: string }
       | undefined
 
@@ -1085,16 +1155,21 @@ router.post('/:patientId/ehr-field-candidates/select', (req: Request, res: Respo
       })
     }
 
-    // 固化目标路径：优先使用前端请求的具体路径（含索引），fallback 到候选记录自身的 field_path
-    // 这样 UI 点击 /治疗情况/药物/0/名称 时，selected 记录落在该具体位置，不会污染同组其它行
-    const targetFieldPath = rawFieldPath.startsWith('/')
+    // 归一化目标路径：与 Python 物化层 _normalize_field_path 对齐 —— 索引段一律剥离，
+    // 行的区分完全押在 (section_instance_id, row_instance_id)。
+    // 若不对齐，Node 侧写入的 field_path 带 /0/，与 Python 写入的干净路径永远不会
+    // 触发 ON CONFLICT，AI→用户 的 selected 覆盖会失效（产生影子记录）。
+    const rawPathWithSlash = rawFieldPath.startsWith('/')
       ? rawFieldPath
       : '/' + rawFieldPath.replace(/\./g, '/')
+    const targetFieldPath = normalizeIndexedFieldPath(rawPathWithSlash)
 
     let candidate:
       | {
           id: string
           instance_id: string
+          section_instance_id: string | null
+          row_instance_id: string | null
           field_path: string
           value_json: string
           value_type: string | null
@@ -1111,7 +1186,7 @@ router.post('/:patientId/ehr-field-candidates/select', (req: Request, res: Respo
       // 候选必须属于当前 instance，并拿到它的 value/source 用于 UPSERT 和审计
       candidate = db
         .prepare(
-          `SELECT id, instance_id, field_path, value_json, value_type,
+          `SELECT id, instance_id, section_instance_id, row_instance_id, field_path, value_json, value_type,
                   source_document_id, source_page, source_block_id, source_bbox_json,
                   source_text, confidence
            FROM field_value_candidates
@@ -1168,8 +1243,37 @@ router.post('/:patientId/ehr-field-candidates/select', (req: Request, res: Respo
     `)
 
     const selectedId = randomUUID()
-    const selectedPosition = resolveSelectedPosition(instance.id, targetFieldPath)
+    // 用含索引的原始路径解析 scope —— 归一化后无法区分行。
+    const selectedPosition = resolveScopeFromPath(instance.id, rawPathWithSlash)
     const selectedCandidateId = candidate?.id || randomUUID()
+
+    if (!selectedPosition.resolved) {
+      return res.status(409).json({
+        success: false,
+        code: 409,
+        message: '字段路径中的重复项索引无法定位，请刷新病历夹后重试',
+        data: { requested_field_path: rawFieldPath },
+      })
+    }
+
+    if (candidate && selectedPosition.hasIndices) {
+      const sameSection = (candidate.section_instance_id || null) === (selectedPosition.sectionInstanceId || null)
+      const sameRow = (candidate.row_instance_id || null) === (selectedPosition.rowInstanceId || null)
+      if (!sameSection || !sameRow) {
+        return res.status(409).json({
+          success: false,
+          code: 409,
+          message: '候选值不属于当前重复项，已拒绝跨行采用',
+          data: {
+            requested_field_path: rawFieldPath,
+            candidate_section_instance_id: candidate.section_instance_id || null,
+            candidate_row_instance_id: candidate.row_instance_id || null,
+            target_section_instance_id: selectedPosition.sectionInstanceId || null,
+            target_row_instance_id: selectedPosition.rowInstanceId || null,
+          },
+        })
+      }
+    }
 
     const doSelect = db.transaction(() => {
       if (!candidate) {

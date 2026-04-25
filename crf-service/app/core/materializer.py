@@ -12,11 +12,107 @@ from __future__ import annotations
 import json
 import logging
 import sqlite3
+import re
 from typing import Any, Dict, List, Optional, Tuple
 
 from app.repo.db import CRFRepo, _normalize_field_path
 
 logger = logging.getLogger("crf-service.materializer")
+
+
+def _schema_node_for_task_path(schema: Dict[str, Any], task_path: List[str]) -> Optional[Dict[str, Any]]:
+    node: Any = schema
+    for part in task_path:
+        if not isinstance(node, dict):
+            return None
+        props = node.get("properties")
+        if isinstance(props, dict) and part in props:
+            node = props[part]
+            continue
+        if node.get("type") == "array" and isinstance(node.get("items"), dict):
+            item_props = node["items"].get("properties")
+            if isinstance(item_props, dict) and part in item_props:
+                node = item_props[part]
+                continue
+        return None
+    return node if isinstance(node, dict) else None
+
+
+def _is_repeatable_task(schema: Dict[str, Any], task_path: List[str]) -> bool:
+    node = _schema_node_for_task_path(schema, task_path)
+    return bool(isinstance(node, dict) and node.get("type") == "array")
+
+
+def _parse_merge_binding(raw: Any) -> Dict[str, str]:
+    if not isinstance(raw, str) or not raw.strip():
+        return {}
+    out: Dict[str, str] = {}
+    for part in raw.split(";"):
+        if "=" not in part:
+            continue
+        key, value = part.split("=", 1)
+        key = key.strip()
+        value = value.strip()
+        if key and value:
+            out[key] = value
+    return out
+
+
+def _value_from_record(record: Any, dotted_path: str) -> Any:
+    if not isinstance(record, dict) or not dotted_path:
+        return None
+    current: Any = record
+    for part in re.split(r"[./]", dotted_path):
+        part = part.strip()
+        if not part:
+            continue
+        if not isinstance(current, dict) or part not in current:
+            return None
+        current = current[part]
+    return current
+
+
+def _normalize_anchor_value(value: Any, granularity: Optional[str] = None) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, (dict, list)):
+        text = json.dumps(value, ensure_ascii=False, sort_keys=True)
+    else:
+        text = str(value).strip()
+    if granularity == "day" and len(text) >= 10:
+        return text[:10]
+    return text
+
+
+def _build_anchor(schema_node: Optional[Dict[str, Any]], record: Any) -> Tuple[Optional[str], Optional[str]]:
+    if not isinstance(schema_node, dict) or not isinstance(record, dict):
+        return None, None
+    binding = _parse_merge_binding(schema_node.get("x-merge-binding"))
+    anchor_field = binding.get("anchor")
+    group_key_field = binding.get("group_key")
+    if not anchor_field and not group_key_field:
+        return None, None
+
+    granularity = binding.get("granularity")
+    parts: List[Tuple[str, str]] = []
+    for label, field in (("anchor", anchor_field), ("group_key", group_key_field)):
+        if not field:
+            continue
+        value = _normalize_anchor_value(_value_from_record(record, field), granularity if label == "anchor" else None)
+        if value:
+            parts.append((field, value))
+
+    if not parts:
+        fallback_field = binding.get("fallback")
+        if fallback_field:
+            value = _normalize_anchor_value(_value_from_record(record, fallback_field), granularity)
+            if value:
+                parts.append((fallback_field, value))
+
+    if not parts:
+        return None, None
+    anchor_key = "|".join(f"{k}={v}" for k, v in parts)
+    return anchor_key, anchor_key
 
 
 class Materializer:
@@ -35,6 +131,7 @@ class Materializer:
         extract_payload: Dict[str, Any],
         content_list: Optional[List[Dict[str, Any]]] = None,
         instance_type: str = "patient_ehr",
+        project_id: Optional[str] = None,
         target_section: Optional[str] = None,
     ) -> str:
         """
@@ -50,7 +147,13 @@ class Materializer:
         Returns:
             instance_id
         """
-        instance_id = self.repo.ensure_schema_instance(conn, patient_id, schema_id, instance_type)
+        instance_id = self.repo.ensure_schema_instance(
+            conn,
+            patient_id,
+            schema_id,
+            instance_type,
+            project_id=project_id,
+        )
         self.repo.ensure_instance_document(conn, instance_id, document_id, relation_type="source")
 
         ts = (target_section or "").strip() or None
@@ -68,6 +171,10 @@ class Materializer:
             task_results = extract_payload.get("task_results") or []
             if not isinstance(task_results, list):
                 task_results = []
+            schema_rec = self.repo.get_schema(conn, schema_id)
+            schema_content = schema_rec.get("content_json") if schema_rec else {}
+            if not isinstance(schema_content, dict):
+                schema_content = {}
 
             # 构建 source_id → 坐标映射（用于溯源高亮）。TextIn position/bbox 为
             # 解析页面图像像素坐标，page_width/page_height 用于前端等比映射到 PDF canvas。
@@ -108,17 +215,41 @@ class Materializer:
                     continue
 
                 section_path = "/" + "/".join(task_path)
-                root_is_repeatable = isinstance(extracted, list)
+                schema_node = _schema_node_for_task_path(schema_content, task_path)
+                schema_is_repeatable = bool(isinstance(schema_node, dict) and schema_node.get("type") == "array")
+                root_is_repeatable = isinstance(extracted, list) or schema_is_repeatable
 
                 if isinstance(extracted, list):
                     for idx, item in enumerate(extracted):
+                        anchor_key, anchor_display = _build_anchor(schema_node, item)
+                        existing_section = None
+                        existing_section = self.repo.find_section_instance_by_anchor(
+                            conn,
+                            instance_id=instance_id,
+                            section_path=section_path,
+                            anchor_key=anchor_key,
+                        ) if schema_is_repeatable and anchor_key else None
+                        if schema_is_repeatable and not existing_section:
+                            existing_section = self.repo.find_section_instance_by_document(
+                                conn,
+                                instance_id=instance_id,
+                                section_path=section_path,
+                                source_document_id=document_id,
+                            )
+                        repeat_index = int(existing_section["repeat_index"]) if existing_section else self.repo.next_section_repeat_index(
+                            conn,
+                            instance_id=instance_id,
+                            section_path=section_path,
+                        )
                         section_instance_id = self.repo.ensure_section_instance(
                             conn,
                             instance_id=instance_id,
                             section_path=section_path,
-                            repeat_index=idx,
+                            repeat_index=repeat_index,
                             is_repeatable=True,
                             created_by="ai",
+                            anchor_key=anchor_key,
+                            anchor_display=anchor_display,
                         )
                         self._persist_node(
                             conn=conn,
@@ -133,13 +264,37 @@ class Materializer:
                             source_id_to_info=source_id_to_info,
                         )
                 else:
+                    repeat_index = 0
+                    existing_section = None
+                    anchor_key, anchor_display = _build_anchor(schema_node, extracted)
+                    if schema_is_repeatable:
+                        existing_section = self.repo.find_section_instance_by_anchor(
+                            conn,
+                            instance_id=instance_id,
+                            section_path=section_path,
+                            anchor_key=anchor_key,
+                        ) if anchor_key else None
+                        if not existing_section:
+                            existing_section = self.repo.find_section_instance_by_document(
+                            conn,
+                            instance_id=instance_id,
+                            section_path=section_path,
+                            source_document_id=document_id,
+                            )
+                        repeat_index = int(existing_section["repeat_index"]) if existing_section else self.repo.next_section_repeat_index(
+                            conn,
+                            instance_id=instance_id,
+                            section_path=section_path,
+                        )
                     section_instance_id = self.repo.ensure_section_instance(
                         conn,
                         instance_id=instance_id,
                         section_path=section_path,
-                        repeat_index=0,
+                        repeat_index=repeat_index,
                         is_repeatable=root_is_repeatable,
                         created_by="ai",
+                        anchor_key=anchor_key,
+                        anchor_display=anchor_display,
                     )
                     self._persist_node(
                         conn=conn,

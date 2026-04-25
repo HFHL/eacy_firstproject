@@ -6,7 +6,7 @@
  *   中部：患者信息概览卡片
  *   底部：SchemaEhrTab（基于 SchemaForm），schema 来自项目模板，data 来自项目 CRF 抽取
  */
-import React, { useMemo } from 'react'
+import React, { useCallback, useMemo } from 'react'
 import { useParams, useNavigate } from 'react-router-dom'
 import {
   Alert,
@@ -25,8 +25,39 @@ import { ArrowLeftOutlined, FileTextOutlined } from '@ant-design/icons'
 
 import SchemaEhrTab from '../PatientDetail/tabs/SchemaEhrTab'
 import useProjectPatientData from './hooks/useProjectPatientData'
+import { updateProjectPatientCrfFields } from '../../api/project'
 
 const { Title, Text } = Typography
+
+function flattenSchemaData(data) {
+  const fields = []
+
+  const visit = (value, pathParts) => {
+    if (Array.isArray(value)) {
+      value.forEach((item, index) => visit(item, [...pathParts, String(index)]))
+      if (value.length === 0 && pathParts.length >= 2) {
+        fields.push({ group_id: pathParts[0], field_key: pathParts.slice(1).join('/'), value })
+      }
+      return
+    }
+
+    if (value && typeof value === 'object') {
+      const entries = Object.entries(value)
+      if (entries.length === 0 && pathParts.length >= 2) {
+        fields.push({ group_id: pathParts[0], field_key: pathParts.slice(1).join('/'), value })
+      }
+      entries.forEach(([key, child]) => visit(child, [...pathParts, key]))
+      return
+    }
+
+    if (pathParts.length >= 2) {
+      fields.push({ group_id: pathParts[0], field_key: pathParts.slice(1).join('/'), value })
+    }
+  }
+
+  visit(data || {}, [])
+  return fields
+}
 
 const ProjectPatientDetail = () => {
   const { projectId, patientId } = useParams()
@@ -41,6 +72,7 @@ const ProjectPatientDetail = () => {
     projectInfo,
     schemaData,
     documents,
+    refresh,
   } = useProjectPatientData(projectId, patientId)
 
   const projectName = projectInfo?.project_name || projectInfo?.name || '未知项目'
@@ -53,6 +85,15 @@ const ProjectPatientDetail = () => {
   }, [patientInfo])
 
   const fatalError = projectError || patientError
+
+  const handleSave = useCallback(async (data) => {
+    const fields = flattenSchemaData(data)
+    const res = await updateProjectPatientCrfFields(projectId, patientId, fields)
+    if (!res?.success) {
+      throw new Error(res?.message || '保存失败')
+    }
+    await refresh()
+  }, [projectId, patientId, refresh])
 
   return (
     <div style={{ padding: 16 }}>
@@ -159,8 +200,7 @@ const ProjectPatientDetail = () => {
             patientId={patientInfo?.patientId || null}
             projectId={projectId}
             documents={documents}
-            readOnly
-            readOnlyHint="项目 CRF 保存接口尚未开放，编辑不会落库"
+            onSave={handleSave}
           />
         )}
       </Card>

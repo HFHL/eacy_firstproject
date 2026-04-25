@@ -225,11 +225,69 @@ function _sourceLocationToCoordinates(loc) {
  */
 function normalizeDocumentCollection(docs) {
   if (!docs) return []
-  if (Array.isArray(docs)) return docs.filter(Boolean)
+  if (Array.isArray(docs)) return docs.filter(Boolean).map(normalizeCandidateDocument)
   if (typeof docs === 'object') {
-    return Object.entries(docs).map(([id, doc]) => ({ id, ...(doc || {}) }))
+    return Object.entries(docs).map(([id, doc]) => normalizeCandidateDocument({ id, ...(doc || {}) }))
   }
   return []
+}
+
+function normalizeDocumentMetadata(metadata) {
+  if (!metadata) return {}
+  if (typeof metadata === 'string') {
+    try {
+      return JSON.parse(metadata)
+    } catch (_) {
+      return {}
+    }
+  }
+  return typeof metadata === 'object' ? metadata : {}
+}
+
+function firstNonEmpty(...values) {
+  for (const value of values) {
+    if (value !== undefined && value !== null && String(value).trim() !== '') {
+      return value
+    }
+  }
+  return undefined
+}
+
+function normalizeCandidateDocument(doc) {
+  if (!doc || typeof doc !== 'object') return doc
+  const metadata = normalizeDocumentMetadata(doc.metadata)
+  const result = normalizeDocumentMetadata(metadata.result)
+  const documentType = firstNonEmpty(
+    doc.document_type,
+    doc.documentType,
+    doc.doc_type,
+    doc.file_type,
+    metadata.documentType,
+    metadata.document_type,
+    metadata.docType,
+    result['文档类型'],
+    doc.category
+  )
+  const documentSubType = firstNonEmpty(
+    doc.document_sub_type,
+    doc.documentSubType,
+    doc.documentSubtype,
+    doc.doc_sub_type,
+    doc.sub_type,
+    metadata.documentSubType,
+    metadata.documentSubtype,
+    metadata.document_sub_type,
+    result['文档子类型'],
+    metadata.subType
+  )
+  return {
+    ...doc,
+    metadata,
+    document_type: documentType,
+    document_sub_type: documentSubType,
+    documentType,
+    documentSubType,
+  }
 }
 
 /**
@@ -259,8 +317,9 @@ function getDocumentDisplayName(doc) {
  * @returns {string}
  */
 function getDocumentTypeLabel(doc) {
-  const mainType = doc?.document_type || doc?.file_type || '未知类型'
-  const subType = doc?.document_sub_type || doc?.sub_type || ''
+  const normalizedDoc = normalizeCandidateDocument(doc)
+  const mainType = normalizedDoc?.document_type || '未知类型'
+  const subType = normalizedDoc?.document_sub_type || ''
   return subType ? `${mainType} | ${subType}` : String(mainType)
 }
 
@@ -1553,7 +1612,7 @@ const DIVIDER_LINE_STYLE = {
   pointerEvents: 'none',
   zIndex: 4
 }
-const SchemaFormInner = ({ onSave, onReset, onFieldCandidateSolidified, externalHistoryRefreshKey = 0, autoSaveInterval = 30000, siderWidth = 220, sourcePanelWidth, collapsible = true, showSourcePanel = true, projectMode = false, projectConfig = null, projectId = null, patientId = null, contentAdaptive = false, leftHeader = null, collapsedTitle = '目录', beforeUploadActions = null }) => {
+const SchemaFormInner = ({ onSave, onReset, onDataChange, onFieldCandidateSolidified, externalHistoryRefreshKey = 0, autoSaveInterval = 30000, siderWidth = 220, sourcePanelWidth, collapsible = true, showSourcePanel = true, projectMode = false, projectConfig = null, projectId = null, patientId = null, contentAdaptive = false, leftHeader = null, collapsedTitle = '目录', beforeUploadActions = null }) => {
   const { state, actions, draftData, patientData, isDirty } = useSchemaForm()
   const [leftCollapsed, setLeftCollapsed] = useState(false)
   const [rightCollapsed, setRightCollapsed] = useState(true)
@@ -1681,7 +1740,8 @@ const SchemaFormInner = ({ onSave, onReset, onFieldCandidateSolidified, external
       const response = await extractEhrDataTargeted(
         String(selectedExtractDocument.id),
         patientId,
-        targetSection
+        targetSection,
+        projectId ? { projectId, instanceType: 'project_crf' } : {}
       )
       if (response.success) {
         message.success('文档抽取任务已提交，请稍候...')
@@ -1695,7 +1755,7 @@ const SchemaFormInner = ({ onSave, onReset, onFieldCandidateSolidified, external
     } finally {
       setExtractConfirming(false)
     }
-  }, [patientId, targetSection, selectedExtractDocument])
+  }, [patientId, projectId, targetSection, selectedExtractDocument])
   const handleUploadExtractFile = useCallback(async (e) => {
     const file = e.target.files?.[0]
     if (!file) return
@@ -1722,6 +1782,7 @@ const SchemaFormInner = ({ onSave, onReset, onFieldCandidateSolidified, external
     message.loading({ content: '正在上传文件并触发 OCR 流水线...', key: 'uploadExtract' })
       const uploadResult = await uploadAndArchiveAsync(file, patientId, {
         targetSection,
+        projectId,
         autoMergeEhr: true,
         parserType: 'textin',
       })
@@ -1756,7 +1817,12 @@ const SchemaFormInner = ({ onSave, onReset, onFieldCandidateSolidified, external
         return
       }
       message.loading({ content: '上传成功，正在提交抽取任务...', key: 'uploadExtract' })
-      const extractResult = await extractEhrDataTargeted(String(docId), patientId, targetSection)
+      const extractResult = await extractEhrDataTargeted(
+        String(docId),
+        patientId,
+        targetSection,
+        projectId ? { projectId, instanceType: 'project_crf' } : {}
+      )
       if (extractResult.success) {
         message.success({ content: '文件上传成功，抽取任务已提交，请稍候...', key: 'uploadExtract' })
         setUploadExtractModalOpen(false)
@@ -1764,7 +1830,7 @@ const SchemaFormInner = ({ onSave, onReset, onFieldCandidateSolidified, external
       } else {
         message.error({ content: extractResult.message || '抽取任务提交失败', key: 'uploadExtract' })
       }
-  }, [patientId, targetSection])
+  }, [patientId, projectId, targetSection])
   const handleSave = useCallback(async (type = 'manual') => {
     if (!isDirty && type === 'manual') { message.info('没有需要保存的修改'); return }
     setSaving(true)
@@ -2210,7 +2276,7 @@ const SchemaFormInner = ({ onSave, onReset, onFieldCandidateSolidified, external
   )
 }
 
-const SchemaForm = ({ schema, enums = {}, patientData, patientId, projectId, onSave, onReset, onFieldCandidateSolidified, externalHistoryRefreshKey = 0, loading = false, autoSaveInterval = 30000, siderWidth = 220, sourcePanelWidth, collapsible = true, showSourcePanel = true, projectMode = false, projectConfig = null, contentAdaptive = false, leftHeader = null, collapsedTitle = '目录', style, onUploadDocument = null, beforeUploadActions = null }) => {
+const SchemaForm = ({ schema, enums = {}, patientData, patientId, projectId, onSave, onReset, onDataChange, onFieldCandidateSolidified, externalHistoryRefreshKey = 0, loading = false, autoSaveInterval = 30000, siderWidth = 220, sourcePanelWidth, collapsible = true, showSourcePanel = true, projectMode = false, projectConfig = null, contentAdaptive = false, leftHeader = null, collapsedTitle = '目录', style, onUploadDocument = null, beforeUploadActions = null }) => {
   const resolvedPatientId = patientId || patientData?.id || patientData?.patient_id || null
   
   if (loading) return <div style={{ height: '100%', display: 'flex', alignItems: 'center', justifyContent: 'center', ...style }}><Spin tip="加载中..." size="large" /></div>
@@ -2218,7 +2284,7 @@ const SchemaForm = ({ schema, enums = {}, patientData, patientId, projectId, onS
   return (
     <div style={{ height: contentAdaptive ? 'auto' : '100%', ...style }}>
       <SchemaFormProvider schema={schema} enums={enums} patientData={patientData}>
-        <SchemaFormInner onSave={onSave} onReset={onReset} onFieldCandidateSolidified={onFieldCandidateSolidified} externalHistoryRefreshKey={externalHistoryRefreshKey} autoSaveInterval={autoSaveInterval} siderWidth={siderWidth} sourcePanelWidth={sourcePanelWidth} collapsible={collapsible} showSourcePanel={showSourcePanel} projectMode={projectMode} projectConfig={projectConfig} projectId={projectId} patientId={resolvedPatientId} contentAdaptive={contentAdaptive} leftHeader={leftHeader} collapsedTitle={collapsedTitle} beforeUploadActions={beforeUploadActions} />
+        <SchemaFormInner onSave={onSave} onReset={onReset} onDataChange={onDataChange} onFieldCandidateSolidified={onFieldCandidateSolidified} externalHistoryRefreshKey={externalHistoryRefreshKey} autoSaveInterval={autoSaveInterval} siderWidth={siderWidth} sourcePanelWidth={sourcePanelWidth} collapsible={collapsible} showSourcePanel={showSourcePanel} projectMode={projectMode} projectConfig={projectConfig} projectId={projectId} patientId={resolvedPatientId} contentAdaptive={contentAdaptive} leftHeader={leftHeader} collapsedTitle={collapsedTitle} beforeUploadActions={beforeUploadActions} />
       </SchemaFormProvider>
     </div>
   )

@@ -187,6 +187,7 @@ CREATE TABLE schema_instances (
   id             TEXT PRIMARY KEY,
   patient_id     TEXT NOT NULL REFERENCES patients(id) ON DELETE CASCADE,
   schema_id      TEXT NOT NULL REFERENCES schemas(id) ON DELETE CASCADE,
+  project_id     TEXT REFERENCES projects(id) ON DELETE CASCADE,
   name           TEXT,
   instance_type  TEXT NOT NULL DEFAULT 'patient_ehr',
   status         TEXT NOT NULL DEFAULT 'draft',
@@ -195,6 +196,7 @@ CREATE TABLE schema_instances (
 );
 CREATE INDEX idx_si_patient  ON schema_instances(patient_id);
 CREATE INDEX idx_si_schema   ON schema_instances(schema_id);
+CREATE INDEX idx_si_project  ON schema_instances(project_id);
 CREATE INDEX idx_si_type     ON schema_instances(instance_type);
 CREATE TABLE instance_documents (
   id             TEXT PRIMARY KEY,

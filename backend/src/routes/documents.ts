@@ -70,9 +70,13 @@ interface DocumentRecord {
   metadata: string          // JSON string in SQLite
   raw_text: string | null
   ocr_payload: string | null
+  ocr_status: string | null
+  ocr_error_message: string | null
   extract_result_json: string | null
   extract_status: string | null
+  extract_error_message: string | null
   meta_status: string | null
+  meta_error_message: string | null
   materialize_status: string | null
   error_message: string | null
   created_at: string
@@ -96,10 +100,31 @@ function safeParseMetadata(raw: string | null | undefined): Record<string, unkno
 
 /** 获取默认 schema 的 UUID id */
 function getDefaultSchemaId(): string | null {
-  const row = db.prepare(
-    `SELECT id FROM schemas WHERE code = 'patient_ehr_v2' AND is_active = 1 ORDER BY version DESC LIMIT 1`
-  ).get() as any
+  const row = db.prepare(`
+    SELECT id
+    FROM schemas
+    WHERE is_active = 1
+      AND code IN ('patient_ehr_v2', 'patient_ehr_v2_crf')
+    ORDER BY CASE code WHEN 'patient_ehr_v2' THEN 0 WHEN 'patient_ehr_v2_crf' THEN 1 ELSE 2 END,
+             version DESC
+    LIMIT 1
+  `).get() as any
   return row?.id ?? null
+}
+
+function inferSingleProjectForPatient(patientId: string | null | undefined): { project_id: string; schema_id: string } | null {
+  if (!patientId) return null
+  const rows = db.prepare(`
+    SELECT p.id AS project_id, p.schema_id
+    FROM project_patients pp
+    JOIN projects p ON p.id = pp.project_id
+    WHERE pp.patient_id = ?
+      AND p.schema_id IS NOT NULL
+      AND TRIM(p.schema_id) != ''
+    ORDER BY pp.enrolled_at DESC, pp.id DESC
+    LIMIT 2
+  `).all(patientId) as Array<{ project_id: string; schema_id: string }>
+  return rows.length === 1 ? rows[0] : null
 }
 
 /** 从 ehr_extraction_jobs 获取文档的最新 job 状态 */
@@ -1015,6 +1040,7 @@ function handleTaskProgress(req: Request, res: Response) {
         document_ids: [doc.id],
         instance_type: instanceType,
       }
+      if (projectId && instanceType === 'project_crf') payload.project_id = projectId
       const targetForm = targetSectionToFormName(targetSectionDot)
       if (targetForm) payload.target_section = targetForm
 
@@ -1691,7 +1717,26 @@ router.post('/:id/extract-ehr', async (req: Request, res: Response) => {
     return res.status(400).json({ success: false, code: 400, message: '无可用的 patient_id 绑定', data: null })
   }
 
-  const schemaId = req.body.schema_id || getDefaultSchemaId();
+  const meta = safeParseMetadata(row.metadata)
+  let requestedProjectId = String(req.body.project_id || meta.project_id || '').trim() || null
+  let schemaId = req.body.schema_id || null
+  let instanceType = req.body.instance_type || null
+
+  if (requestedProjectId) {
+    const proj = db.prepare(`SELECT schema_id FROM projects WHERE id = ?`).get(requestedProjectId) as { schema_id?: string } | undefined
+    if (!proj?.schema_id) {
+      return res.status(400).json({
+        success: false,
+        code: 400,
+        message: '项目未绑定 CRF 模板/schema，无法进行科研靶向抽取',
+        data: { project_id: requestedProjectId },
+      })
+    }
+    schemaId = schemaId || proj.schema_id
+    instanceType = instanceType || 'project_crf'
+  }
+
+  schemaId = schemaId || getDefaultSchemaId();
   if (!schemaId) {
     return res.status(500).json({
       success: false, code: 500,
@@ -1705,15 +1750,26 @@ router.post('/:id/extract-ehr', async (req: Request, res: Response) => {
       patient_id: patientId,
       schema_id: schemaId,
       document_ids: [String(req.params.id)],
-      instance_type: req.body.instance_type || 'patient_ehr',
+      instance_type: instanceType || 'patient_ehr',
     };
+    if (requestedProjectId && payload.instance_type === 'project_crf') payload.project_id = requestedProjectId;
     if (targetSection) payload.target_section = targetSection;
 
-    const response = await crfServiceSubmitSingle(payload);
+    let response: Awaited<ReturnType<typeof crfServiceSubmitSingle>>;
+    try {
+      response = await crfServiceSubmitSingle(payload);
+    } catch (error: any) {
+      return res.status(502).json({
+        success: false,
+        code: 502,
+        message: `CRF 服务不可用：${error?.message || '提交失败'}`,
+        data: { payload },
+      });
+    }
 
     if (!response.ok) {
       const errorText = await response.text();
-      return res.status(response.status).json({ success: false, code: response.status, message: errorText, data: null });
+      return res.status(response.status).json({ success: false, code: response.status, message: errorText, data: { payload } });
     }
 
     const responseData = await response.json();

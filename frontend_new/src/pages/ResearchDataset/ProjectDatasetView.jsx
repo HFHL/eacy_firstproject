@@ -275,6 +275,7 @@ const ProjectDatasetView = () => {
           const { fieldGroups, fieldMapping } = adaptTemplateMeta(
             response.data.template_info.field_groups || [],
             response.data.template_info.db_field_mapping || {},
+            response.data.template_info.schema || response.data.template_info.schema_json || null,
           )
           setTemplateFieldGroups(fieldGroups)
           setTemplateFieldMapping(fieldMapping)
@@ -326,6 +327,7 @@ const ProjectDatasetView = () => {
           const { fieldGroups, fieldMapping } = adaptTemplateMeta(
             Array.isArray(template.field_groups) ? template.field_groups : [],
             template.db_field_mapping || {},
+            schema,
           )
           if (fieldGroups.length > 0) {
             setTemplateFieldGroups(fieldGroups)
@@ -520,7 +522,7 @@ const ProjectDatasetView = () => {
           setExtractionProgress(activeTask)
           setIsExtractionProgressCardDismissed(false)
           setSelectedPatients([])
-          message.warning('该项目已有正在进行的抽取任务')
+          message.warning(response.message || '该患者已有正在进行的抽取任务')
           
           // 恢复轮询
           pollExtractionProgress(activeTask.task_id)
@@ -535,6 +537,48 @@ const ProjectDatasetView = () => {
       setIsExtracting(false)
     }
   }
+
+  const confirmAndStartExtraction = useCallback((patientIds = null, mode = 'incremental', targetGroups = null) => {
+    const normalizedIds = Array.isArray(patientIds) && patientIds.length > 0 ? patientIds.filter(Boolean) : null
+    const targetPatients = normalizedIds
+      ? patientDataset.filter((patient) => normalizedIds.includes(patient.patient_id))
+      : patientDataset
+    const patientsWithHistory = targetPatients.filter((patient) => patient.hasExtractionHistory)
+
+    if (patientsWithHistory.length === 0 && normalizedIds) {
+      handleStartExtraction(normalizedIds, mode, targetGroups)
+      return
+    }
+
+    const previewNames = patientsWithHistory
+      .slice(0, 5)
+      .map((patient) => patient.name || patient.patientId || patient.patient_id)
+      .join('、')
+    const extraCount = Math.max(0, patientsWithHistory.length - 5)
+
+    Modal.confirm({
+      title: '确认重新抽取？',
+      content: (
+        <div>
+          <div>
+            {normalizedIds
+              ? `该科研项目中有 ${patientsWithHistory.length} 位患者已有抽取记录。`
+              : '本次将对项目内患者发起抽取，可能包含已有抽取记录的患者。'}
+          </div>
+          <div style={{ marginTop: 8 }}>重新抽取会清空历史记录并重新抽取，请确认是否继续。</div>
+          {previewNames ? (
+            <div style={{ marginTop: 8, color: token.colorTextSecondary }}>
+              涉及患者：{previewNames}{extraCount > 0 ? ` 等 ${patientsWithHistory.length} 位` : ''}
+            </div>
+          ) : null}
+        </div>
+      ),
+      okText: '确认重新抽取',
+      okButtonProps: { danger: true },
+      cancelText: '取消',
+      onOk: () => handleStartExtraction(normalizedIds, mode, targetGroups),
+    })
+  }, [handleStartExtraction, patientDataset, token.colorTextSecondary])
   
   // 轮询抽取进度
   const pollExtractionProgress = useCallback(async (taskId) => {
@@ -1576,7 +1620,7 @@ const ProjectDatasetView = () => {
                       key: 'incremental',
                       label: '增量续抽',
                       icon: <PlayCircleOutlined />,
-                      onClick: () => handleStartExtraction([record.patient_id], 'incremental'),
+                      onClick: () => confirmAndStartExtraction([record.patient_id], 'incremental'),
                     },
                     {
                       key: 'full',
@@ -1586,11 +1630,11 @@ const ProjectDatasetView = () => {
                       onClick: () => {
                         Modal.confirm({
                           title: `确认对患者 ${record.subject_id || record.name} 全量重抽？`,
-                          content: '已有数据将被覆盖，此操作不可撤销。',
+                          content: '如果该患者已有抽取记录，重新抽取会清空历史记录并重新抽取。',
                           okText: '确认重抽',
                           okButtonProps: { danger: true },
                           cancelText: '取消',
-                          onOk: () => handleStartExtraction([record.patient_id], 'full'),
+                          onOk: () => confirmAndStartExtraction([record.patient_id], 'full'),
                         })
                       },
                     },
@@ -1842,7 +1886,7 @@ const ProjectDatasetView = () => {
                       key: 'incremental',
                       label: '增量续抽',
                       icon: <PlayCircleOutlined />,
-                      onClick: () => handleStartExtraction([record.patient_id], 'incremental'),
+                      onClick: () => confirmAndStartExtraction([record.patient_id], 'incremental'),
                     },
                     {
                       key: 'full',
@@ -1852,11 +1896,11 @@ const ProjectDatasetView = () => {
                       onClick: () => {
                         Modal.confirm({
                           title: `确认对患者 ${record.subject_id || record.name} 全量重抽？`,
-                          content: '已有数据将被覆盖，此操作不可撤销。',
+                          content: '如果该患者已有抽取记录，重新抽取会清空历史记录并重新抽取。',
                           okText: '确认重抽',
                           okButtonProps: { danger: true },
                           cancelText: '取消',
-                          onOk: () => handleStartExtraction([record.patient_id], 'full'),
+                          onOk: () => confirmAndStartExtraction([record.patient_id], 'full'),
                         })
                       },
                     },
@@ -2075,7 +2119,7 @@ const ProjectDatasetView = () => {
 
   const handleExtractGroup = (patientId, groupKey) => {
     if (!groupKey) return
-    handleStartExtraction([patientId], 'incremental', [groupKey])
+    confirmAndStartExtraction([patientId], 'incremental', [groupKey])
   }
 
 
@@ -2133,7 +2177,7 @@ const ProjectDatasetView = () => {
     }
     setExtractionModalVisible(false)
     const patientIds = selectedPatients.length > 0 ? selectedPatients : null
-    await handleStartExtraction(patientIds, extractionModalMode, extractionModalGroups)
+    await confirmAndStartExtraction(patientIds, extractionModalMode, extractionModalGroups)
   }
 
   const handleExportData = () => {
@@ -3105,7 +3149,7 @@ const ProjectDatasetView = () => {
               selectedPatientIds={projectDatasetViewModel.selectedPatientIds}
               onToggleSelectPatient={toggleSelectPatient}
               onNavigatePatient={handleNavigatePatientDetail}
-              onExtractPatient={(patientId) => handleStartExtraction([patientId], 'incremental')}
+              onExtractPatient={(patientId) => confirmAndStartExtraction([patientId], 'incremental')}
               pagination={pagination}
               onPageChange={(page, pageSize) => fetchProjectPatients(page, pageSize)}
               leftScrollY={projectDatasetTableScrollY}
@@ -3762,7 +3806,7 @@ const ProjectDatasetView = () => {
             type="primary"
             icon={<PlayCircleOutlined />}
             disabled={isExtracting}
-            onClick={() => handleStartExtraction(selectedPatients, 'incremental')}
+            onClick={() => confirmAndStartExtraction(selectedPatients, 'incremental')}
           >
             增量抽取
           </Button>
@@ -3774,11 +3818,11 @@ const ProjectDatasetView = () => {
             onClick={() => {
               Modal.confirm({
                 title: `确认对 ${selectedPatients.length} 位患者全量抽取？`,
-                content: '已有数据将被覆盖，此操作不可撤销。',
+                content: '如果所选患者已有抽取记录，重新抽取会清空历史记录并重新抽取。',
                 okText: '确认抽取',
                 okButtonProps: { danger: true },
                 cancelText: '取消',
-                onOk: () => handleStartExtraction(selectedPatients, 'full'),
+                onOk: () => confirmAndStartExtraction(selectedPatients, 'full'),
               })
             }}
           >

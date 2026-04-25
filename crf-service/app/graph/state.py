@@ -17,11 +17,13 @@ class CRFExtractionState(TypedDict, total=False):
     job_id: str                         # ehr_extraction_jobs.id
     patient_id: str
     schema_id: str
+    project_id: Optional[str]              # 科研项目 ID；project_crf 用于项目级隔离
     document_ids: List[str]             # 可选：指定文档 ID，否则按 patient 自动匹配
     instance_type: str                  # "patient_ehr" | "project_crf"
     target_section: Optional[str]       # 可选：靶向 section（形如 "基本信息 / 人口学情况"）。
                                         # 若提供：filter_units 直接裁出该 section 子 schema，
                                         # document_ids 原样传入该唯一 unit，**不**做 x-sources 子类型匹配。
+    target_sections: List[str]          # 可选：多个靶向 section。科研专项抽取会一次提交多个字段组。
 
     # ── load_schema_and_docs 节点输出 ────────────────────────────────────
     schema_content: Dict[str, Any]      # schemas.content_json parsed

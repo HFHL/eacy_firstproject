@@ -303,6 +303,7 @@ const ProjectSchemaEhrTab = ({
           externalHistoryRefreshKey={externalHistoryRefreshKey}
           onSave={handleSave}
           onReset={handleReset}
+          onDataChange={onDataChange}
           onFieldCandidateSolidified={onFieldCandidateSolidified}
           autoSaveInterval={autoSaveInterval}
           {...schemaFormLayoutProps}
@@ -316,4 +317,3 @@ const ProjectSchemaEhrTab = ({
 }
 
 export default ProjectSchemaEhrTab
-

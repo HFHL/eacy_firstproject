@@ -100,7 +100,46 @@ class CRFRepo:
         conn = sqlite3.connect(str(self.db_path), timeout=30)
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA journal_mode=WAL")
+        self._ensure_project_instance_columns(conn)
         return conn
+
+    def _ensure_project_instance_columns(self, conn: sqlite3.Connection) -> None:
+        try:
+            conn.execute(
+                "ALTER TABLE schema_instances ADD COLUMN project_id TEXT NULL REFERENCES projects(id) ON DELETE CASCADE"
+            )
+        except sqlite3.OperationalError:
+            pass
+        try:
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_si_project ON schema_instances(project_id)")
+        except sqlite3.OperationalError:
+            pass
+        try:
+            conn.execute(
+                """
+                UPDATE schema_instances
+                SET project_id = (
+                  SELECT p.id
+                  FROM projects p
+                  JOIN project_patients pp ON pp.project_id = p.id
+                  WHERE p.schema_id = schema_instances.schema_id
+                    AND pp.patient_id = schema_instances.patient_id
+                  LIMIT 1
+                )
+                WHERE instance_type = 'project_crf'
+                  AND project_id IS NULL
+                  AND 1 = (
+                    SELECT COUNT(*)
+                    FROM projects p
+                    JOIN project_patients pp ON pp.project_id = p.id
+                    WHERE p.schema_id = schema_instances.schema_id
+                      AND pp.patient_id = schema_instances.patient_id
+                  )
+                """
+            )
+            conn.commit()
+        except sqlite3.OperationalError:
+            pass
 
     # ─── Schema 读取 ────────────────────────────────────────────────────────
 
@@ -439,6 +478,7 @@ class CRFRepo:
         schema_id: str,
         instance_type: str = "patient_ehr",
         instance_name: Optional[str] = None,
+        project_id: Optional[str] = None,
     ) -> str:
         """
         如实例已存在则返回现有 id，否则创建新实例。
@@ -449,14 +489,25 @@ class CRFRepo:
           3. schemas.name（再从 DB 取一次）
           4. instance_type 原值兜底
         """
-        row = conn.execute(
-            """
-            SELECT id FROM schema_instances
-            WHERE patient_id = ? AND schema_id = ? AND instance_type = ?
-            LIMIT 1
-            """,
-            (patient_id, schema_id, instance_type),
-        ).fetchone()
+        project_id = (project_id or "").strip() or None
+        if instance_type == "project_crf":
+            row = conn.execute(
+                """
+                SELECT id FROM schema_instances
+                WHERE patient_id = ? AND schema_id = ? AND project_id = ? AND instance_type = ?
+                LIMIT 1
+                """,
+                (patient_id, schema_id, project_id, instance_type),
+            ).fetchone()
+        else:
+            row = conn.execute(
+                """
+                SELECT id FROM schema_instances
+                WHERE patient_id = ? AND schema_id = ? AND instance_type = ?
+                LIMIT 1
+                """,
+                (patient_id, schema_id, instance_type),
+            ).fetchone()
         if row:
             return row["id"]
 
@@ -475,10 +526,10 @@ class CRFRepo:
         new_id = _new_id("si")
         conn.execute(
             """
-            INSERT INTO schema_instances (id, patient_id, schema_id, instance_type, name, status, created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?, 'draft', ?, ?)
+            INSERT INTO schema_instances (id, patient_id, schema_id, project_id, instance_type, name, status, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, 'draft', ?, ?)
             """,
-            (new_id, patient_id, schema_id, instance_type, resolved_name, _now_iso(), _now_iso()),
+            (new_id, patient_id, schema_id, project_id, instance_type, resolved_name, _now_iso(), _now_iso()),
         )
         return new_id
 
@@ -514,6 +565,7 @@ class CRFRepo:
         self, conn: sqlite3.Connection, *,
         instance_id: str, section_path: str, repeat_index: int, is_repeatable: bool,
         created_by: str = "ai", parent_section_id: Optional[str] = None,
+        anchor_key: Optional[str] = None, anchor_display: Optional[str] = None,
     ) -> str:
         if parent_section_id is None:
             row = conn.execute(
@@ -526,18 +578,80 @@ class CRFRepo:
                 (instance_id, section_path, repeat_index, parent_section_id),
             ).fetchone()
         if row:
+            if anchor_key or anchor_display:
+                conn.execute(
+                    """
+                    UPDATE section_instances
+                    SET anchor_key = COALESCE(?, anchor_key),
+                        anchor_display = COALESCE(?, anchor_display),
+                        updated_at = ?
+                    WHERE id = ?
+                    """,
+                    (anchor_key, anchor_display, _now_iso(), row["id"]),
+                )
             return row["id"]
         section_id = _new_id("sec")
         conn.execute(
             """
             INSERT INTO section_instances (id, instance_id, section_path, parent_section_id, repeat_index,
                 anchor_key, anchor_display, is_repeatable, created_by, created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?, NULL, NULL, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (section_id, instance_id, section_path, parent_section_id, repeat_index,
-             1 if is_repeatable else 0, created_by, _now_iso(), _now_iso()),
+             anchor_key, anchor_display, 1 if is_repeatable else 0, created_by, _now_iso(), _now_iso()),
         )
         return section_id
+
+    def find_section_instance_by_anchor(
+        self, conn: sqlite3.Connection, *,
+        instance_id: str, section_path: str, anchor_key: str,
+    ) -> Optional[Dict[str, Any]]:
+        row = conn.execute(
+            """
+            SELECT id, repeat_index
+            FROM section_instances
+            WHERE instance_id = ?
+              AND section_path = ?
+              AND anchor_key = ?
+            ORDER BY repeat_index ASC
+            LIMIT 1
+            """,
+            (instance_id, section_path, anchor_key),
+        ).fetchone()
+        return dict(row) if row else None
+
+    def find_section_instance_by_document(
+        self, conn: sqlite3.Connection, *,
+        instance_id: str, section_path: str, source_document_id: str,
+    ) -> Optional[Dict[str, Any]]:
+        row = conn.execute(
+            """
+            SELECT si.id, si.repeat_index
+            FROM section_instances si
+            JOIN field_value_candidates fvc ON fvc.section_instance_id = si.id
+            WHERE si.instance_id = ?
+              AND si.section_path = ?
+              AND fvc.source_document_id = ?
+            ORDER BY si.repeat_index ASC
+            LIMIT 1
+            """,
+            (instance_id, section_path, source_document_id),
+        ).fetchone()
+        return dict(row) if row else None
+
+    def next_section_repeat_index(
+        self, conn: sqlite3.Connection, *,
+        instance_id: str, section_path: str,
+    ) -> int:
+        row = conn.execute(
+            """
+            SELECT COALESCE(MAX(repeat_index), -1) + 1 AS next_idx
+            FROM section_instances
+            WHERE instance_id = ? AND section_path = ?
+            """,
+            (instance_id, section_path),
+        ).fetchone()
+        return int(row["next_idx"] if row else 0)
 
     def ensure_row_instance(
         self, conn: sqlite3.Connection, *,

@@ -789,35 +789,5 @@ backend/eacy.db ".schema llm_call_logs"` 可见）；`crf-service` 的 Celery wo
 发起的 EHR / 靶向 / 项目 CRF 任务都会自动落到表里，admin 详情弹窗里能看到
 "DB 精准"标签。
 
-**Step 3b 已完成（2026-04-23）**：前端 Admin 详情弹窗接入实时 SSE 进度。
-
-改动清单：
-
-1. **crf-service/app/tasks.py**：`run_extraction_task` 把 `graph.ainvoke(...)`
-   换成 `graph.astream(initial_state, stream_mode="updates")`，逐节点捕获
-   `state.progress` 并 `_publish_progress` 到 Redis 频道 `crf:progress:{job_id}`。
-   原先 SSE 只有 `start` / `done` 两条，现在会按顺序推出 `load_schema_and_docs`
-   → `filter_units` → `extract_units` → `materialize` → `done`。
-2. **crf-service/app/main.py**：SSE 终态判断补上 `cancelled`（以前只认
-   `completed/failed`），避免前端订阅已 cancelled 任务时挂着空等 10 分钟。
-3. **backend/src/routes/admin.ts**：新增 `GET /api/v1/admin/extraction-tasks/:id/progress`
-   反代到 `${CRF_SERVICE_URL}/api/extract/{job_id}/progress`。id → job_id
-   映射：project 任务优先取 `project_extraction_tasks.job_ids_json[0]`，
-   否则按 `ehr_extraction_jobs.id` 直查。首先推一条
-   `event: meta` 带上实际 job_id 便于调试；之后原样透传 upstream 的
-   `data: {...}`；upstream 终态结束时同步 `res.end()`。
-4. **frontend_new/src/hooks/useExtractionProgressSSE.js**（新）：基于原生
-   EventSource 的 hook，返回 `{events, lastEvent, status, terminal, error}`。
-   终态（completed/failed/cancelled）到达时主动 `es.close()` 避免默认 3s 自动重连。
-5. **frontend_new/src/pages/Admin/index.jsx**：
-   * 详情弹窗里，当 summary.status ∈ {running, pending} 时调用
-     `useExtractionProgressSSE(taskId, { enabled })`，渲染 `ExtractionProgressStream`
-     时间线（时间戳 + 节点名 + 状态 Tag + 消息）。
-   * SSE `terminal=true` 时 bump `refreshKey` 自动 refetch 一次详情，把
-     summary / jobs / llm_calls 都翻到最终态。
-   * 列表级（`ExtractionTasksTab`）：有 running/pending 任务时启动 5s 轻量
-     REST 轮询（不用 EventSource 每行订阅，规避 HTTP/1.1 的 6 连接同源限制）。
-
-**认证备忘**：`/api/v1/admin/*` 目前无鉴权 middleware，`EventSource` 直接连。
-后续若加上 JWT 认证，需要：把 token 放 querystring 转发、或改用 fetch +
-ReadableStream 手写分帧（原生 EventSource 不能带 header）。
+**Step 3b 待做**：前端对 running 任务接入 `GET /api/extract/{job_id}/progress`
+SSE 做实时进度推送（目前列表里的 running 任务只能靠刷新/手动点详情看状态）。

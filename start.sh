@@ -18,6 +18,19 @@ echo " 🚀 正在启动 EACY 项目全栈服务..."
 echo " 提示：按 Ctrl+C 可同时一键关闭所有服务。"
 echo "=========================================================="
 
+PROJECT_ROOT="$(cd "$(dirname "$0")" && pwd)"
+
+echo "🧹 正在清理历史 CRF Celery Worker..."
+CELERY_PATTERN="${PROJECT_ROOT}/crf-service/.venv/bin/celery -A app.celery_app worker"
+pkill -TERM -f "$CELERY_PATTERN" 2>/dev/null || true
+pkill -TERM -f "cd crf-service && source .venv/bin/activate && celery -A app.celery_app worker" 2>/dev/null || true
+sleep 2
+if pgrep -f "$CELERY_PATTERN" >/dev/null 2>&1; then
+  echo "⚠️  历史 Worker 未正常退出，正在强制清理..."
+  pkill -KILL -f "$CELERY_PATTERN" 2>/dev/null || true
+  sleep 1
+fi
+
 npx concurrently \
   -n "backend,frontend,crf-api,celery" \
   -c "green,cyan,magenta,yellow" \

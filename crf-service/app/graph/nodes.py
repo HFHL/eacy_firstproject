@@ -16,7 +16,7 @@ from typing import Any, Dict, List, Optional
 
 from app.config import settings
 from app.core.extract_pipeline import (
-    _trim_json_schema_form,
+    _trim_schema_for_form,
     extract_pipeline,
     get_document_for_extraction,
     load_schema,
@@ -100,16 +100,19 @@ def node_filter_units(state: CRFExtractionState) -> Dict[str, Any]:
     """
     patient_id = state.get("patient_id", "")
     schema_id = state.get("schema_id", "")
+    target_sections = [str(s).strip() for s in (state.get("target_sections") or []) if str(s).strip()]
     target_section = (state.get("target_section") or "").strip()
+    if target_section:
+        target_sections = [target_section]
 
     # ── 靶向模式 ──
-    if target_section:
+    if target_sections:
         specified_ids = state.get("document_ids") or []
         if not specified_ids:
             logger.warning("[filter] 靶向模式缺少 document_ids，无法抽取")
             return {
                 "extraction_units": [],
-                "pipeline_report": f"靶向模式（{target_section}）：未提供 document_ids",
+                "pipeline_report": f"靶向模式（{', '.join(target_sections)}）：未提供 document_ids",
                 "pipeline_error": "targeted_no_documents",
                 "progress": {
                     "node": "filter_units",
@@ -120,12 +123,26 @@ def node_filter_units(state: CRFExtractionState) -> Dict[str, Any]:
             }
 
         content = state.get("schema_content") or {}
-        trimmed = _trim_json_schema_form(content, target_section)
-        if trimmed is None:
-            logger.warning("[filter] 靶向 section 在 schema 中未找到：%s", target_section)
+        units: List[Dict[str, Any]] = []
+        missing_sections: List[str] = []
+        for section in target_sections:
+            trimmed = _trim_schema_for_form(content, section)
+            if trimmed is None:
+                missing_sections.append(section)
+                continue
+            units.append({
+                "form_name": section,
+                "primary_sources": [],
+                "secondary_sources": [],
+                "matched_document_ids": list(specified_ids),
+                "schema": trimmed,
+            })
+
+        if not units:
+            logger.warning("[filter] 靶向 section 在 schema 中均未找到：%s", target_sections)
             return {
                 "extraction_units": [],
-                "pipeline_report": f"靶向模式（{target_section}）：schema 中未找到该 section",
+                "pipeline_report": f"靶向模式（{', '.join(target_sections)}）：schema 中未找到目标 section",
                 "pipeline_error": "targeted_section_not_found",
                 "progress": {
                     "node": "filter_units",
@@ -135,25 +152,21 @@ def node_filter_units(state: CRFExtractionState) -> Dict[str, Any]:
                 },
             }
 
-        unit = {
-            "form_name": target_section,
-            "primary_sources": [],
-            "secondary_sources": [],
-            "matched_document_ids": list(specified_ids),
-            "schema": trimmed,
-        }
         report = (
-            f"靶向模式：section={target_section}，文档数={len(specified_ids)}（跳过 x-sources 匹配）"
+            f"靶向模式：sections={', '.join([u['form_name'] for u in units])}，"
+            f"文档数={len(specified_ids)}（跳过 x-sources 匹配）"
         )
+        if missing_sections:
+            report += f"；未找到：{', '.join(missing_sections)}"
         logger.info("[filter] %s", report)
         return {
-            "extraction_units": [unit],
+            "extraction_units": units,
             "pipeline_report": report,
             "pipeline_error": None,
             "progress": {
                 "node": "filter_units",
                 "status": "done",
-                "unit_count": 1,
+                "unit_count": len(units),
                 "mode": "targeted",
             },
         }
@@ -350,7 +363,10 @@ def node_materialize(state: CRFExtractionState) -> Dict[str, Any]:
     patient_id = state.get("patient_id", "")
     schema_id = state.get("schema_id", "")
     instance_type = state.get("instance_type", "patient_ehr")
+    project_id = (state.get("project_id") or "").strip() or None
+    target_sections = [str(s).strip() for s in (state.get("target_sections") or []) if str(s).strip()]
     target_section = (state.get("target_section") or "").strip() or None
+    target_path = target_section or (", ".join(target_sections) if target_sections else None)
 
     per_doc_results = _collect_per_doc_task_results(state.get("unit_results") or [])
 
@@ -389,7 +405,8 @@ def node_materialize(state: CRFExtractionState) -> Dict[str, Any]:
                     extract_payload=per_doc_payload,
                     content_list=content_list,
                     instance_type=instance_type,
-                    target_section=target_section,
+                    project_id=project_id,
+                    target_section=target_path,
                 )
                 repo.mark_extract_success(conn, doc_id, state.get("job_id", ""), per_doc_payload)
                 materialized_docs.append(doc_id)

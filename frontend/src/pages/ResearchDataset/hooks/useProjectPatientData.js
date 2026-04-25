@@ -188,7 +188,12 @@ export const useProjectPatientData = (projectId, patientId) => {
   }, [projectId, patientId])
 
   const schemaData = useMemo(
-    () => buildSchemaDataFromCrf(crfData, projectInfo?.schema_json || null),
+    () => {
+      if (crfData?.data && typeof crfData.data === 'object') {
+        return crfData.data
+      }
+      return buildSchemaDataFromCrf(crfData, projectInfo?.schema_json || null)
+    },
     [crfData, projectInfo?.schema_json],
   )
 
