@@ -198,11 +198,18 @@ function _sourceLocationToCoordinates(loc) {
     )
     const isPixel = maxV > 1100
     console.debug('[_sourceLocationToCoordinates]', { bbox: [x1,y1,x2,y2], maxV, isPixel, page })
+    // 保留 TextIn 8 点 polygon（item.polygon 来自后端 parseSourceLocation 的 position 字段）。
+    // 用于精确高亮：拍摄/扫描文档存在轻微倾斜时，多边形比轴对齐 bbox 更贴合实际文字轮廓，
+    // 避免在 PDF 上产生"红框跑出文档外"的视觉错位。
+    const polygon = Array.isArray(item.polygon) && item.polygon.length >= 8
+      ? item.polygon.map(Number)
+      : null
     return {
       x: x1,
       y: y1,
       width: x2 - x1,
       height: y2 - y1,
+      polygon,
       pageWidth: hasTextinPageSize ? rawPageWidth : (isPixel ? null : 1000),
       pageHeight: hasTextinPageSize ? rawPageHeight : (isPixel ? null : 1000),
       pageIdx: Math.max(0, page - 1)
@@ -756,6 +763,8 @@ const SourceDocumentPreview = ({ documentInfo, activeCoordinates, panelWidth = 4
     ? coordsList.map((c) => ({
         page: (c.pageIdx != null ? c.pageIdx : 0) + 1,
         bbox: [c.x, c.y, c.x + (c.width || 0), c.y + (c.height || 0)],
+        // 优先用 8 点 polygon 精确渲染，bbox 仅作回退（旧数据可能没有 polygon）
+        polygon: Array.isArray(c.polygon) && c.polygon.length >= 8 ? c.polygon : null,
         page_width: c.pageWidth || null,
         page_height: c.pageHeight || null,
       }))

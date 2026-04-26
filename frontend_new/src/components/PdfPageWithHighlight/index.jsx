@@ -39,10 +39,16 @@ export function PdfPageWithHighlight({
   const [pagePoints, setPagePoints] = useState({ width: 0, height: 0 })
 
   // 支持单个 bbox 或 locations 数组（多个区块）
+  // 每个 location 可能同时携带 polygon（8 点，TextIn position 原始多边形）和 bbox（4 点轴对齐回退）。
   const hasBbox = Array.isArray(bbox) && bbox.length >= 4
   const hasLocations = Array.isArray(locations) && locations.length > 0
+  const isValidLoc = (loc) =>
+    loc && (
+      (Array.isArray(loc.polygon) && loc.polygon.length >= 8) ||
+      (Array.isArray(loc.bbox) && loc.bbox.length >= 4)
+    )
   const list = hasLocations
-    ? locations.filter((loc) => loc && Array.isArray(loc.bbox) && loc.bbox.length >= 4)
+    ? locations.filter(isValidLoc)
     : hasBbox
       ? [{ bbox, page: pageNumber }]
       : []
@@ -210,6 +216,64 @@ export function PdfPageWithHighlight({
     }
   }
 
+  /**
+   * 将 TextIn 8 点 position 多边形映射到 PDF canvas 像素坐标。
+   * 使用与 toRect 相同的缩放逻辑，但对 4 个角点逐点映射，保持多边形形状。
+   *
+   * 输入: item.polygon = [x1,y1,x2,y2,x3,y3,x4,y4] (顺时针: 左上/右上/右下/左下)
+   * 输出: 4 个 {x, y} 点（canvas 像素坐标），用于 SVG <polygon> points
+   *
+   * 优势：当原文档被拍摄/扫描时存在轻微倾斜，多边形与文字行的实际倾斜方向一致，
+   * 不会像轴对齐 bbox 那样在倾斜方向上"溢出"实际文字范围。
+   */
+  const toPolygonPoints = (item) => {
+    if (!Array.isArray(item.polygon) || item.polygon.length < 8) return null
+    const raw = item.polygon.map(Number)
+    const pts = [
+      { x: raw[0], y: raw[1] },
+      { x: raw[2], y: raw[3] },
+      { x: raw[4], y: raw[5] },
+      { x: raw[6], y: raw[7] },
+    ]
+
+    // 情况 1：PDF 点坐标
+    if (usePageScale && pw > 0 && ph > 0) {
+      return pts.map((p) => ({ x: (p.x / pw) * refW, y: (p.y / ph) * refH }))
+    }
+
+    // 情况 2：原图像素坐标
+    if (pw > 0 && ph > 0) {
+      const origW = item.page_width
+      const origH = item.page_height
+      if (origW > 0 && origH > 0) {
+        return pts.map((p) => ({ x: (p.x / origW) * refW, y: (p.y / origH) * refH }))
+      }
+      // 自动检测：bbox 明显超 PDF 页 → 推断原图尺寸
+      const xs = pts.map((p) => Math.abs(p.x))
+      const ys = pts.map((p) => Math.abs(p.y))
+      const maxBbox = Math.max(...xs, ...ys)
+      const maxPage = Math.max(pw, ph)
+      if (maxBbox > maxPage * 1.1) {
+        const pageAspect = pw / ph
+        const maxX = Math.max(...xs, 1)
+        const maxY = Math.max(...ys, 1)
+        let inferredW = maxX
+        let inferredH = inferredW / pageAspect
+        if (inferredH < maxY) {
+          inferredH = maxY
+          inferredW = inferredH * pageAspect
+        }
+        return pts.map((p) => ({ x: (p.x / inferredW) * refW, y: (p.y / inferredH) * refH }))
+      }
+      return pts.map((p) => ({ x: (p.x / pw) * refW, y: (p.y / ph) * refH }))
+    }
+
+    // 回退：bboxScale 归一化
+    const scale = refW / Number(bboxScale)
+    const scaleY = refH / Number(bboxScale)
+    return pts.map((p) => ({ x: p.x * scale, y: p.y * scaleY }))
+  }
+
   // 始终只渲染一个 canvas（同一 ref），避免 loading 时未挂载导致 effect 拿不到 ref 而卡死
   return (
     <div ref={containerRef} style={{ position: 'relative', display: 'inline-block', maxWidth: maxWidth || '100%' }}>
@@ -230,7 +294,7 @@ export function PdfPageWithHighlight({
         </div>
       )}
       {!showSpinner && viewportSize.width > 0 && list.length > 0 && (
-        <div
+        <svg
           style={{
             position: 'absolute',
             top: 0,
@@ -238,43 +302,56 @@ export function PdfPageWithHighlight({
             width: '100%',
             height: '100%',
             pointerEvents: 'none',
-            boxSizing: 'border-box',
           }}
+          viewBox={`0 0 ${refW} ${refH}`}
+          preserveAspectRatio="none"
         >
           {visibleList.map((item, idx) => {
+            // 优先用 8 点 polygon（贴合实际文字倾斜），否则回退到轴对齐 rect
+            const polyPts = toPolygonPoints(item)
+            if (polyPts) {
+              const pointsAttr = polyPts.map((p) => `${p.x},${p.y}`).join(' ')
+              console.debug('[PdfPageWithHighlight]', {
+                mode: 'polygon',
+                polygon: item.polygon,
+                pagePoints: { pw, ph },
+                canvasPx: { refW, refH },
+                points: polyPts,
+              })
+              return (
+                <polygon
+                  key={idx}
+                  points={pointsAttr}
+                  fill="none"
+                  stroke={appThemeToken.colorError}
+                  strokeWidth="1"
+                  vectorEffect="non-scaling-stroke"
+                />
+              )
+            }
             const rect = toRect(item)
             console.debug('[PdfPageWithHighlight]', {
+              mode: 'bbox',
               bbox: item.bbox,
               pagePoints: { pw, ph },
               canvasPx: { refW, refH },
               rect,
-              leftPct: (rect.left / refW) * 100,
-              topPct: (rect.top / refH) * 100,
-              widthPct: (Math.max(rect.width, 2) / refW) * 100,
-              heightPct: (Math.max(rect.height, 2) / refH) * 100,
             })
-            const leftPct = (rect.left / refW) * 100
-            const topPct = (rect.top / refH) * 100
-            const widthPct = (Math.max(rect.width, 2) / refW) * 100
-            const heightPct = (Math.max(rect.height, 2) / refH) * 100
             return (
-              <div
+              <rect
                 key={idx}
-                style={{
-                  position: 'absolute',
-                  left: `${leftPct}%`,
-                  top: `${topPct}%`,
-                  width: `${widthPct}%`,
-                  height: `${heightPct}%`,
-                  border: `1px solid ${appThemeToken.colorError}`,
-                  backgroundColor: 'transparent',
-                  borderRadius: 0,
-                  boxSizing: 'border-box',
-                }}
+                x={rect.left}
+                y={rect.top}
+                width={Math.max(rect.width, 2)}
+                height={Math.max(rect.height, 2)}
+                fill="none"
+                stroke={appThemeToken.colorError}
+                strokeWidth="1"
+                vectorEffect="non-scaling-stroke"
               />
             )
           })}
-        </div>
+        </svg>
       )}
     </div>
   )
