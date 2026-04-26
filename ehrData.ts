@@ -911,6 +911,7 @@ function resolveSchemaInstance(
 function parseSourceLocation(raw: string | null, page: number | null) {
   if (!raw) return null
   try {
+    const sourcePage = Number.isFinite(Number(page)) ? Number(page) : 1
     let parsed: any = JSON.parse(raw)
     if (typeof parsed === 'string') {
       try {
@@ -923,7 +924,7 @@ function parseSourceLocation(raw: string | null, page: number | null) {
       // 旧版格式：裸数组
       return {
         bbox: parsed,
-        page: page !== null ? page : 1,
+        page: sourcePage,
         position: { x: parsed[0], y: parsed[1] },
       }
     }
@@ -931,7 +932,7 @@ function parseSourceLocation(raw: string | null, page: number | null) {
       // 新版格式：{bbox, page_width, page_height}
       return {
         bbox: parsed.bbox,
-        page: page !== null ? page : 1,
+        page: sourcePage,
         position: { x: parsed.bbox[0], y: parsed.bbox[1] },
         page_width: parsed.page_width || null,
         page_height: parsed.page_height || null,

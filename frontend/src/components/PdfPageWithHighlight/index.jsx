@@ -120,7 +120,11 @@ export function PdfPageWithHighlight({
   const showSpinner = externalLoading || loading
 
   const toRect = (item) => {
-    const [x1, y1, x2, y2] = item.bbox
+    const [rawX1, rawY1, rawX2, rawY2] = item.bbox.map(Number)
+    const x1 = Math.min(rawX1, rawX2)
+    const y1 = Math.min(rawY1, rawY2)
+    const x2 = Math.max(rawX1, rawX2)
+    const y2 = Math.max(rawY1, rawY2)
     const w = x2 - x1
     const h = y2 - y1
     if (usePageScale && pw > 0 && ph > 0) {

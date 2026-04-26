@@ -90,6 +90,60 @@ const normalizeFieldPathSegments = (rawPath) => String(rawPath || '')
  */
 const normalizeFieldPathToDot = (rawPath) => normalizeFieldPathSegments(rawPath).join('.')
 
+const isInternalSchemaFormKey = (key) => String(key || '').startsWith('_')
+
+const getValueAtDotPath = (data, dotPath) => {
+  const parts = String(dotPath || '').split('.').filter(Boolean)
+  let cursor = data
+  for (const part of parts) {
+    if (cursor === null || cursor === undefined) return undefined
+    if (Array.isArray(cursor) && /^\d+$/.test(part)) {
+      cursor = cursor[Number(part)]
+      continue
+    }
+    if (typeof cursor !== 'object') return undefined
+    cursor = cursor[part]
+  }
+  return cursor
+}
+
+const flattenEditableLeafValues = (data) => {
+  const leaves = []
+  const visit = (value, pathParts) => {
+    if (Array.isArray(value)) {
+      value.forEach((item, index) => visit(item, [...pathParts, String(index)]))
+      if (value.length === 0 && pathParts.length > 0) {
+        leaves.push({ path: pathParts.join('.'), value })
+      }
+      return
+    }
+
+    if (value && typeof value === 'object') {
+      const entries = Object.entries(value).filter(([key]) => !isInternalSchemaFormKey(key))
+      if (entries.length === 0 && pathParts.length > 0) {
+        leaves.push({ path: pathParts.join('.'), value })
+      }
+      entries.forEach(([key, child]) => visit(child, [...pathParts, key]))
+      return
+    }
+
+    if (pathParts.length > 0) {
+      leaves.push({ path: pathParts.join('.'), value })
+    }
+  }
+  visit(data || {}, [])
+  return leaves
+}
+
+const buildProjectCrfFieldUpdates = (draftData, originalData, isValueEqual) => {
+  return flattenEditableLeafValues(draftData)
+    .filter(({ path, value }) => !isValueEqual(value === undefined ? null : value, getValueAtDotPath(originalData, path)))
+    .map(({ path, value }) => ({
+      field_path: `/${path.split('.').filter(Boolean).join('/')}`,
+      value: value === undefined ? null : value,
+    }))
+}
+
 /**
  * 构造科研 CRF 字段在 SchemaForm 中使用的 canonical 点分路径。
  * @param {string} groupId
@@ -904,47 +958,9 @@ const ProjectPatientDetail = () => {
       }
     })
 
-    // 按模板 canonical group_id + db_field 生成更新，避免用 draft 路径首段误判 group_id。
-    const updates = []
-    const hookTemplateGroups = (Array.isArray(projectTemplateGroups) ? projectTemplateGroups : []).map((group) => ({
-      key: String(group?.key || ''),
-      name: String(group?.name || ''),
-      dbFields: Array.isArray(group?.dbFields) ? group.dbFields : [],
-    }))
-    const templateGroups = projectTemplateFieldGroups.length > 0
-      ? projectTemplateFieldGroups
-      : hookTemplateGroups
-    const currentGroups = currentCrfData?.groups && typeof currentCrfData.groups === 'object'
-      ? currentCrfData.groups
-      : {}
-    templateGroups.forEach((groupMeta) => {
-      const groupId = String(groupMeta?.key || '')
-      if (!groupId) return
-      const dbFields = Array.isArray(groupMeta?.dbFields) ? groupMeta.dbFields : []
-      const currentGroupFields = currentGroups?.[groupId]?.fields && typeof currentGroups[groupId].fields === 'object'
-        ? currentGroups[groupId].fields
-        : {}
-      dbFields.forEach((dbFieldPath) => {
-        const fieldPath = String(dbFieldPath || '').trim()
-        if (!fieldPath) return
-        const newValue = getSchemaFieldValue(draftData, fieldPath, {
-          field_path: fieldPath,
-          db_field: fieldPath,
-        })
-        const oldValue = readGroupFieldValueByPath(currentGroupFields, fieldPath, groupMeta?.name || '')
-        // 删除/清空字段时，draft 中可能读不到值（undefined），此时若旧值存在需显式写 null 才能真正清空。
-        const normalizedNewValue = newValue === undefined ? null : newValue
-        if (!isValueEqual(normalizedNewValue, oldValue)) {
-          const rowUid = resolveRowUidByPath(draftData, fieldPath)
-          updates.push({
-            group_id: groupId,
-            field_key: fieldPath,
-            value: normalizedNewValue,
-            row_uid: rowUid || undefined,
-          })
-        }
-      })
-    })
+    // 按实际 SchemaForm 草稿的叶子路径生成 delta。
+    // 这样不会把可重复表单整列数组写到错误字段，也不会依赖模板 db_fields 与 UI 路径完全一致。
+    const updates = buildProjectCrfFieldUpdates(draftData, currentSchemaData, isValueEqual)
 
     if (updates.length === 0) {
       message.info('没有需要保存的修改')
@@ -969,7 +985,7 @@ const ProjectPatientDetail = () => {
       console.error('[handleProjectSchemaSave] 保存异常:', e)
       message.error(e?.message || '保存失败')
     }
-  }, [projectId, resolvedProjectPatientId, refresh, getSchemaFieldValue, projectTemplateGroups, projectTemplateFieldGroups, resolveRowUidByPath])
+  }, [projectId, resolvedProjectPatientId, refresh, isValueEqual])
 
   /**
    * 候选值固化后强制刷新科研患者详情，确保前后端状态一致。

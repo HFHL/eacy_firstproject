@@ -171,7 +171,11 @@ function _sourceLocationToCoordinates(loc) {
       )
     }
     if (!Array.isArray(bbox) || bbox.length < 4) return null
-    let [x1, y1, x2, y2] = bbox
+    const [rawX1, rawY1, rawX2, rawY2] = bbox.map(Number)
+    const x1 = Math.min(rawX1, rawX2)
+    const y1 = Math.min(rawY1, rawY2)
+    const x2 = Math.max(rawX1, rawX2)
+    const y2 = Math.max(rawY1, rawY2)
     const maxCoord = Math.max(x1, y1, x2, y2)
     const isAbsolute = maxCoord > 1000
     

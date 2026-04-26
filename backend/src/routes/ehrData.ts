@@ -442,32 +442,49 @@ router.put('/:patientId/ehr-schema-data', (req: Request, res: Response) => {
       })
     }
 
-    // Read existing selected values into a map
-    const existingRows = db.prepare(`
-      SELECT field_path, selected_value_json
-      FROM field_value_selected
-      WHERE instance_id = ?
-    `).all(instance.id) as any[]
-    const existingMap = new Map<string, string>()
-    for (const row of existingRows) {
-      existingMap.set(row.field_path, row.selected_value_json)
-    }
-
-    // Flatten newData into field paths
-    const flatFields: Array<{ path: string; value: string }> = []
+    // Flatten newData into editable leaf field paths. Keep repeatable indices in
+    // requestedPath for scope resolution, but store normalized field_path without
+    // numeric indices to match extractor/materializer conventions.
+    const flatFields: Array<{ requestedPath: string; storagePath: string; valueJson: string; rawValue: any }> = []
     function flatten(obj: any, parts: string[] = []) {
-      if (obj === null || obj === undefined) return
+      if (parts.length > 0 && String(parts[0] || '').startsWith('_')) return
       if (Array.isArray(obj)) {
         obj.forEach((item, index) => flatten(item, [...parts, String(index)]))
+        if (obj.length === 0 && parts.length > 0) {
+          const requestedPath = '/' + parts.join('/')
+          flatFields.push({
+            requestedPath,
+            storagePath: normalizeIndexedFieldPath(requestedPath),
+            valueJson: JSON.stringify(obj),
+            rawValue: obj,
+          })
+        }
         return
       }
       if (typeof obj === 'object') {
+        if (obj === null) {
+          const requestedPath = '/' + parts.join('/')
+          flatFields.push({
+            requestedPath,
+            storagePath: normalizeIndexedFieldPath(requestedPath),
+            valueJson: 'null',
+            rawValue: null,
+          })
+          return
+        }
         for (const key of Object.keys(obj)) {
+          if (key.startsWith('_')) continue
           flatten(obj[key], [...parts, key])
         }
         return
       }
-      flatFields.push({ path: '/' + parts.join('/'), value: JSON.stringify(obj) })
+      const requestedPath = '/' + parts.join('/')
+      flatFields.push({
+        requestedPath,
+        storagePath: normalizeIndexedFieldPath(requestedPath),
+        valueJson: JSON.stringify(obj),
+        rawValue: obj,
+      })
     }
     flatten(newData)
 
@@ -476,6 +493,12 @@ router.put('/:patientId/ehr-schema-data', (req: Request, res: Response) => {
       INSERT INTO field_value_candidates
         (id, instance_id, field_path, value_json, value_type, source_text, confidence, created_by)
       VALUES (?, ?, ?, ?, ?, ?, ?, 'user')
+    `)
+
+    const insertScopedCandidate = db.prepare(`
+      INSERT INTO field_value_candidates
+        (id, instance_id, section_instance_id, row_instance_id, field_path, value_json, value_type, source_text, confidence, created_by)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'user')
     `)
 
     const upsertSelected = db.prepare(`
@@ -490,15 +513,38 @@ router.put('/:patientId/ehr-schema-data', (req: Request, res: Response) => {
         updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
     `)
 
+    const upsertScopedSelected = db.prepare(`
+      INSERT INTO field_value_selected
+        (id, instance_id, section_instance_id, row_instance_id, field_path, selected_candidate_id, selected_value_json, selected_by)
+      VALUES (?, ?, ?, ?, ?, ?, ?, 'user')
+      ON CONFLICT(instance_id, COALESCE(section_instance_id, '__null__'), COALESCE(row_instance_id, '__null__'), field_path)
+      DO UPDATE SET
+        selected_candidate_id = excluded.selected_candidate_id,
+        selected_value_json = excluded.selected_value_json,
+        selected_by = 'user',
+        updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+    `)
+
     let changedCount = 0
     let totalCount = 0
 
     const saveAll = db.transaction(() => {
       for (const field of flatFields) {
         totalCount++
-        const oldValue = existingMap.get(field.path)
+        const scope = resolveScopeFromPath(instance.id, field.requestedPath)
+        if (!scope.resolved) continue
 
-        if (oldValue === field.value) {
+        const oldRow = db.prepare(`
+          SELECT selected_value_json FROM field_value_selected
+          WHERE instance_id = ?
+            AND COALESCE(section_instance_id, '__null__') = COALESCE(?, '__null__')
+            AND COALESCE(row_instance_id, '__null__') = COALESCE(?, '__null__')
+            AND field_path = ?
+          LIMIT 1
+        `).get(instance.id, scope.sectionInstanceId, scope.rowInstanceId, field.storagePath) as { selected_value_json: string } | undefined
+        const oldValue = oldRow?.selected_value_json
+
+        if (oldValue === field.valueJson) {
           // Value unchanged — skip
           continue
         }
@@ -507,24 +553,47 @@ router.put('/:patientId/ehr-schema-data', (req: Request, res: Response) => {
 
         // Create a new candidate (extraction history record)
         const candidateId = randomUUID()
-        const valueType = field.value.startsWith('[') ? 'array'
-          : field.value.startsWith('"') ? 'string'
-          : /^\d/.test(field.value) ? 'number'
-          : 'string'
+        const valueType = inferValueType(field.rawValue)
 
-        insertCandidate.run(
-          candidateId,
-          instance.id,
-          field.path,
-          field.value,
-          valueType,
-          '用户手动编辑',
-          null // no confidence for manual edits
-        )
+        if (scope.sectionInstanceId || scope.rowInstanceId) {
+          insertScopedCandidate.run(
+            candidateId,
+            instance.id,
+            scope.sectionInstanceId,
+            scope.rowInstanceId,
+            field.storagePath,
+            field.valueJson,
+            valueType,
+            '用户手动编辑',
+            null
+          )
+        } else {
+          insertCandidate.run(
+            candidateId,
+            instance.id,
+            field.storagePath,
+            field.valueJson,
+            valueType,
+            '用户手动编辑',
+            null // no confidence for manual edits
+          )
+        }
 
         // Update selected value
         const selectedId = randomUUID()
-        upsertSelected.run(selectedId, instance.id, field.path, candidateId, field.value)
+        if (scope.sectionInstanceId || scope.rowInstanceId) {
+          upsertScopedSelected.run(
+            selectedId,
+            instance.id,
+            scope.sectionInstanceId,
+            scope.rowInstanceId,
+            field.storagePath,
+            candidateId,
+            field.valueJson
+          )
+        } else {
+          upsertSelected.run(selectedId, instance.id, field.storagePath, candidateId, field.valueJson)
+        }
       }
     })
 
@@ -916,6 +985,7 @@ function resolveSchemaInstance(
 function parseSourceLocation(raw: string | null, page: number | null) {
   if (!raw) return null
   try {
+    const sourcePage = Number.isFinite(Number(page)) ? Number(page) : 1
     let parsed: any = JSON.parse(raw)
     if (typeof parsed === 'string') {
       try {
@@ -928,7 +998,7 @@ function parseSourceLocation(raw: string | null, page: number | null) {
       // 旧版格式：裸数组
       return {
         bbox: parsed,
-        page: page !== null ? page : 1,
+        page: sourcePage,
         position: { x: parsed[0], y: parsed[1] },
       }
     }
@@ -936,7 +1006,7 @@ function parseSourceLocation(raw: string | null, page: number | null) {
       // 新版格式：{bbox, page_width, page_height}
       return {
         bbox: parsed.bbox,
-        page: page !== null ? page : 1,
+        page: sourcePage,
         position: { x: parsed.bbox[0], y: parsed.bbox[1] },
         page_width: parsed.page_width || null,
         page_height: parsed.page_height || null,

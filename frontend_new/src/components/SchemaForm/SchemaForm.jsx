@@ -186,7 +186,11 @@ function _sourceLocationToCoordinates(loc) {
       )
     }
     if (!Array.isArray(bbox) || bbox.length < 4) return null
-    const [x1, y1, x2, y2] = bbox.map(Number)
+    const [rawX1, rawY1, rawX2, rawY2] = bbox.map(Number)
+    const x1 = Math.min(rawX1, rawX2)
+    const y1 = Math.min(rawY1, rawY2)
+    const x2 = Math.max(rawX1, rawX2)
+    const y2 = Math.max(rawY1, rawY2)
     const page = item.page != null ? Number(item.page) : 1
     // 根据数值量级自动识别坐标单位：<=1100 视为 0-1000 归一化，否则视为原图像素
     const maxV = Math.max(
@@ -541,7 +545,7 @@ const ModificationHistory = ({
         await selectEhrFieldCandidateV3(patientId, queryPath, candidateId, selectedValue, rowUid)
       }
       if (typeof onCandidateApplied === 'function' && selectedCandidate) {
-        onCandidateApplied(queryPath, selectedValue, rowUid)
+        onCandidateApplied(queryPath, selectedValue, rowUid, selectedCandidate)
       }
       message.success('已采用此值')
       setSelectRefreshTick((tick) => tick + 1)
@@ -1473,7 +1477,29 @@ const SourcePanel = ({
                 patientId={patientId}
                 projectId={projectId}
                 refreshKey={historyRefreshKey}
-                onCandidateApplied={onCandidateApplied}
+                onCandidateApplied={(appliedPath, appliedValue, appliedRowUid, appliedCandidate) => {
+                  if (appliedCandidate?.source_document_id) {
+                    setSuppressAutoSourceDoc(false)
+                    setSelectedHistoryItem({
+                      id: appliedCandidate.id,
+                      field_path: appliedPath,
+                      matched_field_path: appliedCandidate.field_path || appliedPath,
+                      new_value: appliedValue,
+                      change_type: appliedCandidate.created_by === 'ai' ? 'extract' : 'manual_edit',
+                      change_type_display: appliedCandidate.created_by === 'ai' ? 'AI 抽取' : '手动修改',
+                      operator_type: appliedCandidate.created_by || null,
+                      operator_name: appliedCandidate.created_by === 'ai' ? 'AI系统' : '用户',
+                      source_document_id: appliedCandidate.source_document_id || null,
+                      source_document_name: appliedCandidate.source_document_name || null,
+                      source_page: appliedCandidate.source_page ?? null,
+                      source_location: appliedCandidate.source_location || null,
+                      source_text: appliedCandidate.source_text || null,
+                      confidence: appliedCandidate.confidence ?? null,
+                      created_at: appliedCandidate.created_at || null,
+                    })
+                  }
+                  onCandidateApplied?.(appliedPath, appliedValue, appliedRowUid, appliedCandidate)
+                }}
                 // 用户主动点击「查看溯源」时，允许对当前记录发起文档请求（包括 revoke 记录）
                 onViewSource={
                   patientId

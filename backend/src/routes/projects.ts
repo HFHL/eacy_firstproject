@@ -1083,6 +1083,83 @@ function paramId(v: string | string[] | undefined): string {
   return String(x ?? '').trim()
 }
 
+function normalizeProjectFieldPath(rawPath: string): string {
+  let fieldPath = String(rawPath || '').trim()
+  if (!fieldPath) return '/'
+  if (!fieldPath.startsWith('/')) {
+    fieldPath = '/' + fieldPath.replace(/\./g, '/')
+  }
+  return fieldPath.replace(/\/+/g, '/')
+}
+
+function stripProjectFieldPathIndices(rawPath: string): string {
+  return '/' + normalizeProjectFieldPath(rawPath)
+    .split('/')
+    .filter(Boolean)
+    .filter((segment) => !/^\d+$/.test(segment))
+    .join('/')
+}
+
+function resolveProjectFieldScope(instanceId: string, rawPath: string): {
+  sectionInstanceId: string | null
+  rowInstanceId: string | null
+  hasIndices: boolean
+  resolved: boolean
+} {
+  const segments = normalizeProjectFieldPath(rawPath).split('/').filter(Boolean)
+  const hasIndices = segments.some((segment) => /^\d+$/.test(segment))
+  if (!hasIndices) {
+    return { sectionInstanceId: null, rowInstanceId: null, hasIndices: false, resolved: true }
+  }
+
+  let sectionInstanceId: string | null = null
+  let rowInstanceId: string | null = null
+  let parentSectionId: string | null = null
+  let parentRowId: string | null = null
+  const cumulative: string[] = []
+
+  for (const segment of segments) {
+    if (!/^\d+$/.test(segment)) {
+      cumulative.push(segment)
+      continue
+    }
+
+    const repeatIndex = Number(segment)
+    const groupPath = '/' + cumulative.join('/')
+    const row = db.prepare(`
+      SELECT id FROM row_instances
+      WHERE instance_id = ? AND group_path = ? AND repeat_index = ?
+        AND COALESCE(parent_row_id, '__null__') = COALESCE(?, '__null__')
+      LIMIT 1
+    `).get(instanceId, groupPath, repeatIndex, parentRowId) as { id: string } | undefined
+
+    if (row) {
+      parentRowId = row.id
+      rowInstanceId = row.id
+      continue
+    }
+
+    const sectionPath = '/' + cumulative.filter((part) => !/^\d+$/.test(part)).join('/')
+    const section = db.prepare(`
+      SELECT id FROM section_instances
+      WHERE instance_id = ? AND section_path = ? AND repeat_index = ?
+        AND COALESCE(parent_section_id, '__null__') = COALESCE(?, '__null__')
+      LIMIT 1
+    `).get(instanceId, sectionPath, repeatIndex, parentSectionId) as { id: string } | undefined
+
+    if (section) {
+      parentSectionId = section.id
+      sectionInstanceId = section.id
+      cumulative.push(segment)
+      continue
+    }
+
+    return { sectionInstanceId, rowInstanceId, hasIndices: true, resolved: false }
+  }
+
+  return { sectionInstanceId, rowInstanceId, hasIndices: true, resolved: true }
+}
+
 /**
  * PATCH /api/v1/projects/:projectId
  * 更新科研项目基础信息。
@@ -1565,10 +1642,29 @@ router.patch('/:projectId/patients/:patientId/crf/fields', (req: Request, res: R
         updated_at           = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
     `)
 
+    const upsertScopedSelected = db.prepare(`
+      INSERT INTO field_value_selected
+        (id, instance_id, section_instance_id, row_instance_id, field_path,
+         selected_candidate_id, selected_value_json, selected_by)
+      VALUES (?, ?, ?, ?, ?, ?, ?, 'user')
+      ON CONFLICT(instance_id, COALESCE(section_instance_id, '__null__'), COALESCE(row_instance_id, '__null__'), field_path)
+      DO UPDATE SET
+        selected_candidate_id = excluded.selected_candidate_id,
+        selected_value_json  = excluded.selected_value_json,
+        selected_by          = 'user',
+        updated_at           = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+    `)
+
     const insertCandidate = db.prepare(`
       INSERT INTO field_value_candidates
         (id, instance_id, field_path, value_json, value_type, source_text, confidence, created_by)
       VALUES (?, ?, ?, ?, ?, ?, ?, 'user')
+    `)
+
+    const insertScopedCandidate = db.prepare(`
+      INSERT INTO field_value_candidates
+        (id, instance_id, section_instance_id, row_instance_id, field_path, value_json, value_type, source_text, confidence, created_by)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'user')
     `)
 
     const updatedAt = new Date().toISOString()
@@ -1576,11 +1672,15 @@ router.patch('/:projectId/patients/:patientId/crf/fields', (req: Request, res: R
 
     const saveAll = db.transaction(() => {
       for (const field of fields) {
+        const explicitFieldPath = String(field?.field_path || field?.path || '').trim()
         const groupId = String(field?.group_id || '').trim()
         const fieldKey = String(field?.field_key || '').trim()
-        if (!groupId || !fieldKey) continue
+        if (!explicitFieldPath && (!groupId || !fieldKey)) continue
 
-        const fieldPath = `${groupId}/${fieldKey}`
+        const requestedFieldPath = explicitFieldPath || `${groupId}/${fieldKey}`
+        const fieldPath = stripProjectFieldPathIndices(requestedFieldPath)
+        const scope = resolveProjectFieldScope(instanceId, requestedFieldPath)
+        if (!scope.resolved) continue
         const rawValue = field?.value
         const valueJson = rawValue === null || rawValue === undefined
           ? 'null'
@@ -1593,26 +1693,55 @@ router.patch('/:projectId/patients/:patientId/crf/fields', (req: Request, res: R
         // 检查旧值是否相同
         const existing = db.prepare(`
           SELECT selected_value_json FROM field_value_selected
-          WHERE instance_id = ? AND field_path = ?
-        `).get(instanceId, fieldPath) as { selected_value_json: string } | undefined
+          WHERE instance_id = ?
+            AND COALESCE(section_instance_id, '__null__') = COALESCE(?, '__null__')
+            AND COALESCE(row_instance_id, '__null__') = COALESCE(?, '__null__')
+            AND field_path = ?
+        `).get(instanceId, scope.sectionInstanceId, scope.rowInstanceId, fieldPath) as { selected_value_json: string } | undefined
         if (existing && existing.selected_value_json === valueJson) {
           continue
         }
 
         // 写入候选值
         const candidateId = randomUUID()
-        insertCandidate.run(
-          candidateId,
-          instanceId,
-          fieldPath,
-          valueJson,
-          valueType,
-          '用户手动编辑',
-          null
-        )
+        if (scope.sectionInstanceId || scope.rowInstanceId) {
+          insertScopedCandidate.run(
+            candidateId,
+            instanceId,
+            scope.sectionInstanceId,
+            scope.rowInstanceId,
+            fieldPath,
+            valueJson,
+            valueType,
+            '用户手动编辑',
+            null
+          )
+        } else {
+          insertCandidate.run(
+            candidateId,
+            instanceId,
+            fieldPath,
+            valueJson,
+            valueType,
+            '用户手动编辑',
+            null
+          )
+        }
 
         // 写入选中值
-        upsertSelected.run(randomUUID(), instanceId, fieldPath, candidateId, valueJson)
+        if (scope.sectionInstanceId || scope.rowInstanceId) {
+          upsertScopedSelected.run(
+            randomUUID(),
+            instanceId,
+            scope.sectionInstanceId,
+            scope.rowInstanceId,
+            fieldPath,
+            candidateId,
+            valueJson
+          )
+        } else {
+          upsertSelected.run(randomUUID(), instanceId, fieldPath, candidateId, valueJson)
+        }
         changedCount++
       }
 

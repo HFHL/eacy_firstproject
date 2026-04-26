@@ -137,7 +137,11 @@ export function PdfPageWithHighlight({
    *     用 PDF 页尺寸作为参考（假设 PDF 填充了同宽高比原图）
    */
   const toRect = (item) => {
-    const [x1, y1, x2, y2] = item.bbox
+    const [rawX1, rawY1, rawX2, rawY2] = item.bbox.map(Number)
+    const x1 = Math.min(rawX1, rawX2)
+    const y1 = Math.min(rawY1, rawY2)
+    const x2 = Math.max(rawX1, rawX2)
+    const y2 = Math.max(rawY1, rawY2)
     const w = x2 - x1
     const h = y2 - y1
 
@@ -168,12 +172,22 @@ export function PdfPageWithHighlight({
       const maxBbox = Math.max(Math.abs(x1), Math.abs(y1), Math.abs(x2), Math.abs(y2))
       const maxPage = Math.max(pw, ph)
       if (maxBbox > maxPage * 1.1) {
-        // bbox 明显超出 PDF 页范围：用 PDF 页尺寸作为参考（等比假设）
+        // bbox 明显超出 PDF 页范围：旧 OCR 像素坐标但缺少原图尺寸。
+        // 以 PDF 页宽高比推断一个能容纳 bbox 的原图尺寸，避免按 PDF 点数缩放导致红框跑到页外。
+        const pageAspect = pw / ph
+        const maxX = Math.max(Math.abs(x1), Math.abs(x2), 1)
+        const maxY = Math.max(Math.abs(y1), Math.abs(y2), 1)
+        let inferredW = maxX
+        let inferredH = inferredW / pageAspect
+        if (inferredH < maxY) {
+          inferredH = maxY
+          inferredW = inferredH * pageAspect
+        }
         return {
-          left: (x1 / maxPage) * pw,
-          top: (y1 / maxPage) * ph,
-          width: (w / maxPage) * pw,
-          height: (h / maxPage) * ph,
+          left: (x1 / inferredW) * refW,
+          top: (y1 / inferredH) * refH,
+          width: (w / inferredW) * refW,
+          height: (h / inferredH) * refH,
         }
       }
       // bbox 在页范围内，视为已归一化到 PDF 页
